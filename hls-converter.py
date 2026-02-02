@@ -103,24 +103,28 @@ class StreamConverter:
             segment_pattern = stream_dir / "segment_%03d.ts"
 
             # FFmpeg command for DASH to HLS conversion
+            # Use segment muxer with mpegts format for better stability
             cmd = [
                 "ffmpeg",
-                "-loglevel", "warning",  # Reduce verbosity
+                "-loglevel", "fatal",  # Only show fatal errors
                 "-i", dash_url,
+                "-map", "0:v:0",  # Map first video stream
+                "-map", "0:a:0",  # Map first audio stream
                 "-c:v", "copy",  # Copy video (no re-encode)
                 "-c:a", "copy",  # Copy audio (no re-encode)
-                "-f", "hls",
-                "-hls_time", str(HLS_SEGMENT_DURATION),
-                "-hls_list_size", str(HLS_LIST_SIZE),
-                "-hls_flags", "delete_segments+append_list+program_date_time",  # Add program date time for sync
-                "-hls_segment_type", "mpegts",  # Explicitly use MPEG-TS container
-                "-hls_segment_filename", str(segment_pattern),
-                "-start_number", "0",  # Start segment numbering at 0
-                "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
-                "-fflags", "+genpts+discardcorrupt",  # Generate PTS and discard corrupt packets
-                "-max_muxing_queue_size", "1024",  # Increase muxing queue to handle sync issues
-                "-err_detect", "ignore_err",  # Ignore minor errors in source stream
-                str(playlist_path)
+                "-copyts",  # Copy timestamps
+                "-start_at_zero",  # Start timestamps at zero
+                "-vsync", "passthrough",  # Don't mess with video sync
+                "-f", "segment",  # Use segment muxer
+                "-segment_time", str(HLS_SEGMENT_DURATION),
+                "-segment_format", "mpegts",  # Output MPEG-TS segments
+                "-segment_list", str(playlist_path),
+                "-segment_list_type", "m3u8",
+                "-segment_list_size", str(HLS_LIST_SIZE),
+                "-segment_list_flags", "+live",
+                "-break_non_keyframes", "1",  # Allow breaking on non-keyframes for consistent segment size
+                "-reset_timestamps", "1",  # Reset timestamps per segment
+                str(segment_pattern)
             ]
 
             logger.info(f"Starting new FFmpeg conversion for stream {stream_id}")
