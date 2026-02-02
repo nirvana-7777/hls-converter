@@ -113,7 +113,11 @@ class StreamConverter:
                 "-hls_time", str(HLS_SEGMENT_DURATION),
                 "-hls_list_size", str(HLS_LIST_SIZE),
                 "-hls_flags", "delete_segments+append_list",
+                "-hls_segment_type", "mpegts",  # Explicitly use MPEG-TS container
                 "-hls_segment_filename", str(segment_pattern),
+                "-start_number", "0",  # Start segment numbering at 0
+                "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
+                "-fflags", "+genpts",  # Generate presentation timestamps
                 str(playlist_path)
             ]
 
