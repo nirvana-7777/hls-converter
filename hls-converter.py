@@ -151,6 +151,18 @@ class StreamConverter:
                 # Monitor process in background
                 asyncio.create_task(self._monitor_process(stream_id, process))
 
+                # Wait for playlist to be ready (up to 10 seconds)
+                playlist_ready = False
+                for _ in range(50):  # 50 * 0.2s = 10s max wait
+                    if playlist_path.exists():
+                        playlist_ready = True
+                        logger.info(f"Playlist ready for stream {stream_id}")
+                        break
+                    await asyncio.sleep(0.2)
+
+                if not playlist_ready:
+                    logger.warning(f"Playlist not ready after 10s for stream {stream_id}")
+
                 return stream_id, True
 
             except Exception as e:
@@ -169,19 +181,35 @@ class StreamConverter:
             stdout, stderr = await process.communicate()
 
             if process.returncode != 0:
-                logger.error(f"FFmpeg process {stream_id} failed with code {process.returncode}")
+                # Return code 255 often means terminated by signal, which is normal
+                if process.returncode == 255:
+                    logger.info(f"FFmpeg process {stream_id} terminated (code 255)")
+                else:
+                    logger.error(f"FFmpeg process {stream_id} failed with code {process.returncode}")
+
                 if stderr:
-                    logger.error(f"FFmpeg stderr: {stderr.decode()[:500]}")
+                    stderr_text = stderr.decode()[:500]
+                    # Only log non-monotonic DTS warnings at debug level
+                    if "Non-monotonic DTS" in stderr_text:
+                        logger.debug(f"FFmpeg stderr: {stderr_text}")
+                    else:
+                        logger.error(f"FFmpeg stderr: {stderr_text}")
         except Exception as e:
             logger.error(f"Error monitoring process {stream_id}: {e}")
 
-        # Cleanup after process ends
+        # Cleanup after process ends - schedule cleanup to avoid event loop issues
+        await self._cleanup_stream(stream_id)
+
+    async def _cleanup_stream(self, stream_id: str):
+        """Cleanup stream data and directory"""
+        url_hash = None
+
         async with self.lock:
             if stream_id in self.active_streams:
                 url_hash = self.active_streams[stream_id]["url_hash"]
 
                 # Remove URL mapping
-                if url_hash in self.url_to_stream_id:
+                if url_hash and url_hash in self.url_to_stream_id:
                     del self.url_to_stream_id[url_hash]
 
                 # Remove from active streams
@@ -191,7 +219,7 @@ class StreamConverter:
                 if stream_id in self.stream_subscribers:
                     del self.stream_subscribers[stream_id]
 
-        # Cleanup directory
+        # Cleanup directory (outside lock)
         stream_dir = Path(TEMP_DIR) / stream_id
         if stream_dir.exists():
             try:
@@ -414,14 +442,23 @@ async def get_hls_playlist(request):
 
     stream_info = await converter.get_stream_info(stream_id)
 
-    if not stream_info:
-        # Check if playlist exists (might be cached)
+    # Determine playlist path
+    if stream_info:
+        playlist_path = stream_info["dir"] / "index.m3u8"
+    else:
+        # Stream not active, but check if playlist exists (might be cached/ending)
         playlist_path = Path(TEMP_DIR) / stream_id / "index.m3u8"
 
+    # Check if playlist exists
+    if not playlist_path.exists():
+        # Wait briefly in case it's being created
+        for _ in range(5):  # Wait up to 1 second
+            await asyncio.sleep(0.2)
+            if playlist_path.exists():
+                break
+
         if not playlist_path.exists():
-            return web.json_response({"error": "Stream not found or expired"}, status=404)
-    else:
-        playlist_path = stream_info["dir"] / "index.m3u8"
+            return web.json_response({"error": "Stream not found or not ready yet"}, status=404)
 
     try:
         async with aiofiles.open(playlist_path, "r") as f:
@@ -436,7 +473,12 @@ async def get_hls_playlist(request):
         return web.Response(
             text=playlist_content,
             content_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache"}
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type"
+            }
         )
 
     except Exception as e:
@@ -460,7 +502,14 @@ async def get_hls_segment(request):
     segment_path = Path(TEMP_DIR) / stream_id / segment
 
     if not segment_path.exists():
-        return web.json_response({"error": "Segment not found"}, status=404)
+        # Wait briefly in case segment is being written
+        for _ in range(5):  # Wait up to 1 second
+            await asyncio.sleep(0.2)
+            if segment_path.exists():
+                break
+
+        if not segment_path.exists():
+            return web.json_response({"error": "Segment not found"}, status=404)
 
     try:
         async with aiofiles.open(segment_path, "rb") as f:
@@ -469,7 +518,12 @@ async def get_hls_segment(request):
         return web.Response(
             body=segment_data,
             content_type="video/MP2T",
-            headers={"Cache-Control": "max-age=3600"}
+            headers={
+                "Cache-Control": "max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type"
+            }
         )
 
     except Exception as e:
