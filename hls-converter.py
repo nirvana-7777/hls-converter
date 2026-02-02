@@ -41,15 +41,20 @@ logger = logging.getLogger(__name__)
 
 
 class StreamConverter:
-    """Manages DASH to HLS conversion with activity tracking and deduplication"""
-
     def __init__(self):
         self.active_streams: Dict[str, dict] = {}
-        self.url_to_stream_id: Dict[str, str] = {}  # URL hash -> stream_id mapping
-        self.stream_subscribers: Dict[str, Set[str]] = {}  # stream_id -> set of client IDs
-        self.lock = asyncio.Lock()
-        self.shutdown_event = asyncio.Event()
-        self.file_ready_events: Dict[str, asyncio.Condition] = {}
+        self.url_to_stream_id: Dict[str, str] = {}
+        self.stream_subscribers: Dict[str, Set[str]] = {}
+        # Don't create Lock or Event here!
+        self.lock = None
+        self.shutdown_event = None
+
+    async def setup(self):
+        """Initialize async primitives within the correct running loop"""
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        if self.shutdown_event is None:
+            self.shutdown_event = asyncio.Event()
 
     @staticmethod
     def _hash_url(url: str) -> str:
@@ -369,6 +374,10 @@ converter = StreamConverter()
 
 async def cleanup_task():
     """Background task to clean up inactive streams"""
+    # Wait for converter to be initialized
+    while converter.shutdown_event is None:
+        await asyncio.sleep(0.1)
+
     while not converter.shutdown_event.is_set():
         try:
             await asyncio.sleep(CLEANUP_INTERVAL)
@@ -515,15 +524,13 @@ async def health(request):
 
 
 async def on_startup(app):
-    """Startup tasks"""
     logger.info("Starting HLS Converter Service...")
 
-    # Clean up orphaned directories from previous runs
+    # Initialize the converter's locks within the current loop
+    await converter.setup()
+
     await converter.cleanup_orphaned_directories()
-
-    # Start cleanup task
     app['cleanup_task'] = asyncio.create_task(cleanup_task())
-
     logger.info("HLS Converter Service started successfully")
 
 
