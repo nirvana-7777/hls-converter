@@ -9,20 +9,16 @@ Enhanced with:
 - Async I/O
 """
 
-import os
 import sys
 import time
 import uuid
 import signal
 import asyncio
-import subprocess
 import hashlib
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Set
 
 from aiohttp import web
-import aiofiles
 import logging
 
 # Configuration
@@ -53,87 +49,71 @@ class StreamConverter:
         self.stream_subscribers: Dict[str, Set[str]] = {}  # stream_id -> set of client IDs
         self.lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
+        self.file_ready_events: Dict[str, asyncio.Condition] = {}
 
-    def _hash_url(self, url: str) -> str:
+    @staticmethod
+    def _hash_url(url: str) -> str:
         """Create a hash of the URL for deduplication"""
         return hashlib.sha256(url.encode()).hexdigest()[:16]
 
     async def convert_to_hls(self, dash_url: str, client_id: Optional[str] = None) -> Optional[tuple]:
         """
-        Convert DASH stream to HLS with deduplication
-        Returns: (stream_id, is_new_stream)
+        Convert DASH stream to HLS with deduplication and optimized startup.
         """
         url_hash = self._hash_url(dash_url)
 
         async with self.lock:
-            # Check if stream already exists for this URL
+            # 1. Deduplication Logic
             if url_hash in self.url_to_stream_id:
-                existing_stream_id = self.url_to_stream_id[url_hash]
-
-                # Verify stream is still active
-                if existing_stream_id in self.active_streams:
-                    logger.info(f"Reusing existing stream {existing_stream_id} for URL hash {url_hash}")
-
-                    # Add client to subscribers
+                existing_id = self.url_to_stream_id[url_hash]
+                if existing_id in self.active_streams:
+                    logger.info(f"Reusing stream {existing_id} for {url_hash}")
                     if client_id:
-                        self.stream_subscribers[existing_stream_id].add(client_id)
+                        self.stream_subscribers[existing_id].add(client_id)
 
-                    # Update activity
-                    self.active_streams[existing_stream_id]["last_activity"] = time.time()
-                    self.active_streams[existing_stream_id]["subscriber_count"] = len(
-                        self.stream_subscribers[existing_stream_id]
-                    )
-
-                    return existing_stream_id, False
+                    self.active_streams[existing_id]["last_activity"] = time.time()
+                    self.active_streams[existing_id]["subscriber_count"] = len(self.stream_subscribers[existing_id])
+                    return existing_id, False
                 else:
-                    # Stale mapping, remove it
                     del self.url_to_stream_id[url_hash]
 
-            # Check max streams limit
+            # 2. Resource Guard
             if len(self.active_streams) >= MAX_STREAMS:
-                logger.warning(f"Maximum streams ({MAX_STREAMS}) reached")
+                logger.warning(f"Max streams ({MAX_STREAMS}) reached. Blocking request.")
                 return None, False
 
-            # Create new stream
+            # 3. Setup Directory Structure
             stream_id = str(uuid.uuid4())[:8]
             stream_dir = Path(TEMP_DIR) / stream_id
             stream_dir.mkdir(exist_ok=True)
 
-            playlist_path = stream_dir / "index.m3u8"
-            segment_pattern = stream_dir / "segment_%03d.ts"
+            playlist_filename = "index.m3u8"
+            playlist_path = stream_dir / playlist_filename
+            segment_pattern = "segment_%03d.ts"
 
-            # FFmpeg command for DASH to HLS conversion
-            # Use segment muxer with mpegts format for better stability
+            # 4. Optimized FFmpeg Command
+            # -map 0: ensures all streams (video/audio) are copied
+            # -hls_flags: omit_endlist is crucial for live streams so players don't stop
             cmd = [
-                "ffmpeg",
-                "-loglevel", "fatal",  # Only show fatal errors
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
                 "-i", dash_url,
-                "-map", "0:v:0",  # Map first video stream
-                "-map", "0:a:0",  # Map first audio stream
-                "-c:v", "copy",  # Copy video (no re-encode)
-                "-c:a", "copy",  # Copy audio (no re-encode)
-                "-copyts",  # Copy timestamps
-                "-start_at_zero",  # Start timestamps at zero
-                "-vsync", "passthrough",  # Don't mess with video sync
-                "-f", "segment",  # Use segment muxer
-                "-segment_time", str(HLS_SEGMENT_DURATION),
-                "-segment_format", "mpegts",  # Output MPEG-TS segments
-                "-segment_list", str(playlist_path),
-                "-segment_list_type", "m3u8",
-                "-segment_list_size", str(HLS_LIST_SIZE),
-                "-segment_list_flags", "+live",
-                "-break_non_keyframes", "1",  # Allow breaking on non-keyframes for consistent segment size
-                "-reset_timestamps", "1",  # Reset timestamps per segment
-                str(segment_pattern)
+                "-c", "copy",
+                "-map", "0",
+                "-f", "hls",
+                "-hls_time", str(HLS_SEGMENT_DURATION),
+                "-hls_list_size", str(HLS_LIST_SIZE),
+                "-hls_flags", "delete_segments+independent_segments+omit_endlist",
+                "-hls_segment_type", "mpegts",
+                "-hls_segment_filename", segment_pattern,
+                "-start_number", "0",
+                playlist_filename
             ]
 
-            logger.info(f"Starting new FFmpeg conversion for stream {stream_id}")
-            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-
-            # Start FFmpeg process
             try:
+                # Start FFmpeg with cwd set to the stream directory
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    cwd=str(stream_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
@@ -146,43 +126,30 @@ class StreamConverter:
                     "request_count": 0,
                     "dash_url": dash_url,
                     "url_hash": url_hash,
-                    "subscriber_count": 0
+                    "subscriber_count": 1 if client_id else 0
                 }
 
-                # Map URL to stream
                 self.url_to_stream_id[url_hash] = stream_id
+                self.stream_subscribers[stream_id] = {client_id} if client_id else set()
 
-                # Initialize subscribers set
-                self.stream_subscribers[stream_id] = set()
-                if client_id:
-                    self.stream_subscribers[stream_id].add(client_id)
-                    self.active_streams[stream_id]["subscriber_count"] = 1
-
-                # Monitor process in background
+                # Monitor the process for failures
                 asyncio.create_task(self._monitor_process(stream_id, process))
 
-                # Wait for playlist to be ready (up to 10 seconds)
-                playlist_ready = False
-                for _ in range(50):  # 50 * 0.2s = 10s max wait
-                    if playlist_path.exists():
-                        playlist_ready = True
-                        logger.info(f"Playlist ready for stream {stream_id}")
-                        break
-                    await asyncio.sleep(0.2)
-
-                if not playlist_ready:
-                    logger.warning(f"Playlist not ready after 10s for stream {stream_id}")
+                # 5. Non-blocking wait for initial segment/playlist
+                try:
+                    # Use our robust utility instead of a hard-coded loop
+                    await asyncio.wait_for(wait_for_file(playlist_path), timeout=10.0)
+                    logger.info(f"Stream {stream_id} started successfully.")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Stream {stream_id} process started, but playlist took >10s to appear.")
 
                 return stream_id, True
 
             except Exception as e:
-                logger.error(f"FFmpeg failed for stream {stream_id}: {e}")
-
-                # Cleanup on failure
+                logger.error(f"Failed to launch FFmpeg for {stream_id}: {e}")
                 if stream_dir.exists():
                     import shutil
                     shutil.rmtree(stream_dir)
-
                 return None, False
 
     async def _monitor_process(self, stream_id: str, process: asyncio.subprocess.Process):
@@ -216,7 +183,6 @@ class StreamConverter:
 
     async def _cleanup_stream(self, stream_id: str):
         """Cleanup stream data and directory"""
-        url_hash = None
 
         async with self.lock:
             if stream_id in self.active_streams:
@@ -447,102 +413,69 @@ async def convert_stream(request):
 
 
 async def get_hls_playlist(request):
-    """Serve HLS playlist"""
     stream_id = request.match_info['stream_id']
     client_id = request.query.get('client_id')
 
-    # Update activity tracking
     await converter.update_activity(stream_id, client_id)
-
     stream_info = await converter.get_stream_info(stream_id)
 
-    # Determine playlist path
-    if stream_info:
-        playlist_path = stream_info["dir"] / "index.m3u8"
-    else:
-        # Stream not active, but check if playlist exists (might be cached/ending)
-        playlist_path = Path(TEMP_DIR) / stream_id / "index.m3u8"
+    if not stream_info:
+        return web.json_response({"error": "Stream not active"}, status=404)
 
-    # Check if playlist exists
+    playlist_path = stream_info["dir"] / "index.m3u8"
+
+    # Wait for the first write if it's a brand new stream
     if not playlist_path.exists():
-        # Wait briefly in case it's being created
-        for _ in range(5):  # Wait up to 1 second
-            await asyncio.sleep(0.2)
-            if playlist_path.exists():
-                break
+        try:
+            # Efficient wait for up to 5 seconds
+            await asyncio.wait_for(wait_for_file(playlist_path), timeout=5.0)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "Playlist timeout"}, status=404)
 
-        if not playlist_path.exists():
-            return web.json_response({"error": "Stream not found or not ready yet"}, status=404)
-
-    try:
-        async with aiofiles.open(playlist_path, "r") as f:
-            playlist_content = await f.read()
-
-        # Update URLs in playlist to point to our service
-        playlist_content = playlist_content.replace(
-            "segment_",
-            f"/hls/{stream_id}/segment_"
-        )
-
-        return web.Response(
-            text=playlist_content,
-            content_type="application/vnd.apple.mpegurl",
-            headers={
-                "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type"
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error serving playlist for {stream_id}: {e}")
-        return web.json_response({"error": "Internal server error"}, status=500)
+    # Use FileResponse for zero-copy transfer
+    return web.FileResponse(
+        playlist_path,
+        headers={
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
 
 
 async def get_hls_segment(request):
-    """Serve HLS segment (.ts file)"""
     stream_id = request.match_info['stream_id']
     segment = request.match_info['segment']
-    client_id = request.query.get('client_id')
 
-    # Validate segment name to prevent path traversal
-    if not segment.endswith('.ts') or '/' in segment or '\\' in segment or '..' in segment:
-        return web.json_response({"error": "Invalid segment name"}, status=400)
-
-    # Update activity tracking
-    await converter.update_activity(stream_id, client_id)
+    # Path traversal protection
+    if not segment.endswith('.ts') or any(x in segment for x in ['/', '\\', '..']):
+        return web.json_response({"error": "Invalid segment"}, status=400)
 
     segment_path = Path(TEMP_DIR) / stream_id / segment
 
+    # If the player is faster than the converter, wait for the file to appear
     if not segment_path.exists():
-        # Wait briefly in case segment is being written
-        for _ in range(5):  # Wait up to 1 second
-            await asyncio.sleep(0.2)
-            if segment_path.exists():
-                break
+        try:
+            await asyncio.wait_for(wait_for_file(segment_path), timeout=3.0)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "Segment not ready"}, status=404)
 
-        if not segment_path.exists():
-            return web.json_response({"error": "Segment not found"}, status=404)
+    return web.FileResponse(
+        segment_path,
+        headers={
+            "Content-Type": "video/MP2T",
+            "Cache-Control": "max-age=3600",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
 
-    try:
-        async with aiofiles.open(segment_path, "rb") as f:
-            segment_data = await f.read()
 
-        return web.Response(
-            body=segment_data,
-            content_type="video/MP2T",
-            headers={
-                "Cache-Control": "max-age=3600",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type"
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error serving segment {segment}: {e}")
-        return web.json_response({"error": "Internal server error"}, status=500)
+async def wait_for_file(path: Path):
+    """Non-blocking check for file existence using exponential backoff"""
+    delay = 0.05
+    while not path.exists():
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 0.5)  # Cap delay at 500ms
 
 
 async def list_streams(request):
