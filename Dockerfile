@@ -13,8 +13,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY hls_converter.py .
+# Copy application code (note: file has HYPHEN, not underscore)
+COPY hls-converter.py .
 
 # Create temp directory for segments
 RUN mkdir -p /tmp/hls_segments
@@ -26,5 +26,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the application (note: filename has underscore)
-CMD ["python", "hls_converter.py"]
+# Run the application (note: filename has HYPHEN, not underscore)
+CMD ["python", "hls-converter.py"]
