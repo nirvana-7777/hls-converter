@@ -112,12 +112,14 @@ class StreamConverter:
                 "-f", "hls",
                 "-hls_time", str(HLS_SEGMENT_DURATION),
                 "-hls_list_size", str(HLS_LIST_SIZE),
-                "-hls_flags", "delete_segments+append_list",
+                "-hls_flags", "delete_segments+append_list+program_date_time",  # Add program date time for sync
                 "-hls_segment_type", "mpegts",  # Explicitly use MPEG-TS container
                 "-hls_segment_filename", str(segment_pattern),
                 "-start_number", "0",  # Start segment numbering at 0
                 "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
-                "-fflags", "+genpts",  # Generate presentation timestamps
+                "-fflags", "+genpts+discardcorrupt",  # Generate PTS and discard corrupt packets
+                "-max_muxing_queue_size", "1024",  # Increase muxing queue to handle sync issues
+                "-err_detect", "ignore_err",  # Ignore minor errors in source stream
                 str(playlist_path)
             ]
 
@@ -201,8 +203,12 @@ class StreamConverter:
         except Exception as e:
             logger.error(f"Error monitoring process {stream_id}: {e}")
 
-        # Cleanup after process ends - schedule cleanup to avoid event loop issues
-        await self._cleanup_stream(stream_id)
+        # Schedule cleanup in the main event loop to avoid "different loop" errors
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._cleanup_stream(stream_id))
+        except Exception as e:
+            logger.error(f"Error scheduling cleanup for {stream_id}: {e}")
 
     async def _cleanup_stream(self, stream_id: str):
         """Cleanup stream data and directory"""
