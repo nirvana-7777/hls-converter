@@ -2,112 +2,197 @@
 """
 HLS Converter Service
 Converts DASH (MPD) to HLS (M3U8/TS) on-the-fly
+Enhanced with:
+- Stream deduplication
+- Graceful shutdown
+- Orphaned segment cleanup
+- Async I/O
 """
 
 import os
+import sys
 import time
 import uuid
 import signal
-import threading
+import asyncio
 import subprocess
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, Dict, Set
 
-from flask import Flask, Response, request, jsonify
+from aiohttp import web
+import aiofiles
 import logging
-import requests
-
-app = Flask(__name__)
 
 # Configuration
 HLS_SEGMENT_DURATION = 2  # seconds
 HLS_LIST_SIZE = 5  # segments in playlist
-CLEANUP_INTERVAL = 300  # seconds
-MAX_STREAMS = 10
+CLEANUP_INTERVAL = 60  # Check every 60 seconds
+INACTIVITY_TIMEOUT = 30  # Stop stream after 30 seconds of no requests
+MAX_STREAM_AGE = 3600  # Maximum stream age regardless of activity
 TEMP_DIR = "/tmp/hls_segments"
+MAX_STREAMS = 10  # Maximum concurrent streams
 
 # Ensure temp directory exists
 Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
 class StreamConverter:
-    """Manages DASH to HLS conversion"""
+    """Manages DASH to HLS conversion with activity tracking and deduplication"""
 
     def __init__(self):
-        self.active_streams = {}
-        self.lock = threading.Lock()
+        self.active_streams: Dict[str, dict] = {}
+        self.url_to_stream_id: Dict[str, str] = {}  # URL hash -> stream_id mapping
+        self.stream_subscribers: Dict[str, Set[str]] = {}  # stream_id -> set of client IDs
+        self.lock = asyncio.Lock()
+        self.shutdown_event = asyncio.Event()
 
-    def convert_to_hls(self, stream_id, dash_url):
-        """Convert DASH stream to HLS"""
-        stream_dir = Path(TEMP_DIR) / str(stream_id)
-        stream_dir.mkdir(exist_ok=True)
+    def _hash_url(self, url: str) -> str:
+        """Create a hash of the URL for deduplication"""
+        return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-        playlist_path = stream_dir / "index.m3u8"
-        segment_pattern = stream_dir / "segment_%03d.ts"
+    async def convert_to_hls(self, dash_url: str, client_id: Optional[str] = None) -> Optional[tuple]:
+        """
+        Convert DASH stream to HLS with deduplication
+        Returns: (stream_id, is_new_stream)
+        """
+        url_hash = self._hash_url(dash_url)
 
-        # FFmpeg command for DASH to HLS conversion
-        cmd = [
-            "ffmpeg",
-            "-i", dash_url,
-            "-c:v", "copy",  # Copy video (no re-encode)
-            "-c:a", "copy",  # Copy audio (no re-encode)
-            "-f", "hls",
-            "-hls_time", str(HLS_SEGMENT_DURATION),
-            "-hls_list_size", str(HLS_LIST_SIZE),
-            "-hls_flags", "delete_segments+append_list",
-            "-hls_segment_filename", str(segment_pattern),
-            str(playlist_path)
-        ]
+        async with self.lock:
+            # Check if stream already exists for this URL
+            if url_hash in self.url_to_stream_id:
+                existing_stream_id = self.url_to_stream_id[url_hash]
 
-        logger.info(f"Starting FFmpeg conversion for stream {stream_id}")
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+                # Verify stream is still active
+                if existing_stream_id in self.active_streams:
+                    logger.info(f"Reusing existing stream {existing_stream_id} for URL hash {url_hash}")
 
-        # Start FFmpeg process
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
+                    # Add client to subscribers
+                    if client_id:
+                        self.stream_subscribers[existing_stream_id].add(client_id)
 
-            with self.lock:
+                    # Update activity
+                    self.active_streams[existing_stream_id]["last_activity"] = time.time()
+                    self.active_streams[existing_stream_id]["subscriber_count"] = len(
+                        self.stream_subscribers[existing_stream_id]
+                    )
+
+                    return existing_stream_id, False
+                else:
+                    # Stale mapping, remove it
+                    del self.url_to_stream_id[url_hash]
+
+            # Check max streams limit
+            if len(self.active_streams) >= MAX_STREAMS:
+                logger.warning(f"Maximum streams ({MAX_STREAMS}) reached")
+                return None, False
+
+            # Create new stream
+            stream_id = str(uuid.uuid4())[:8]
+            stream_dir = Path(TEMP_DIR) / stream_id
+            stream_dir.mkdir(exist_ok=True)
+
+            playlist_path = stream_dir / "index.m3u8"
+            segment_pattern = stream_dir / "segment_%03d.ts"
+
+            # FFmpeg command for DASH to HLS conversion
+            cmd = [
+                "ffmpeg",
+                "-loglevel", "warning",  # Reduce verbosity
+                "-i", dash_url,
+                "-c:v", "copy",  # Copy video (no re-encode)
+                "-c:a", "copy",  # Copy audio (no re-encode)
+                "-f", "hls",
+                "-hls_time", str(HLS_SEGMENT_DURATION),
+                "-hls_list_size", str(HLS_LIST_SIZE),
+                "-hls_flags", "delete_segments+append_list",
+                "-hls_segment_filename", str(segment_pattern),
+                str(playlist_path)
+            ]
+
+            logger.info(f"Starting new FFmpeg conversion for stream {stream_id}")
+            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+
+            # Start FFmpeg process
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
                 self.active_streams[stream_id] = {
                     "process": process,
                     "dir": stream_dir,
                     "start_time": time.time(),
-                    "dash_url": dash_url
+                    "last_activity": time.time(),
+                    "request_count": 0,
+                    "dash_url": dash_url,
+                    "url_hash": url_hash,
+                    "subscriber_count": 0
                 }
 
-            # Monitor process in background
-            threading.Thread(
-                target=self._monitor_process,
-                args=(stream_id, process),
-                daemon=True
-            ).start()
+                # Map URL to stream
+                self.url_to_stream_id[url_hash] = stream_id
 
-            return stream_dir
+                # Initialize subscribers set
+                self.stream_subscribers[stream_id] = set()
+                if client_id:
+                    self.stream_subscribers[stream_id].add(client_id)
+                    self.active_streams[stream_id]["subscriber_count"] = 1
 
-        except Exception as e:
-            logger.error(f"FFmpeg failed for stream {stream_id}: {e}")
-            return None
+                # Monitor process in background
+                asyncio.create_task(self._monitor_process(stream_id, process))
 
-    def _monitor_process(self, stream_id, process):
+                return stream_id, True
+
+            except Exception as e:
+                logger.error(f"FFmpeg failed for stream {stream_id}: {e}")
+
+                # Cleanup on failure
+                if stream_dir.exists():
+                    import shutil
+                    shutil.rmtree(stream_dir)
+
+                return None, False
+
+    async def _monitor_process(self, stream_id: str, process: asyncio.subprocess.Process):
         """Monitor FFmpeg process"""
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = await process.communicate()
 
-        if process.returncode != 0:
-            logger.error(f"FFmpeg process {stream_id} failed: {stderr}")
+            if process.returncode != 0:
+                logger.error(f"FFmpeg process {stream_id} failed with code {process.returncode}")
+                if stderr:
+                    logger.error(f"FFmpeg stderr: {stderr.decode()[:500]}")
+        except Exception as e:
+            logger.error(f"Error monitoring process {stream_id}: {e}")
 
-        with self.lock:
+        # Cleanup after process ends
+        async with self.lock:
             if stream_id in self.active_streams:
+                url_hash = self.active_streams[stream_id]["url_hash"]
+
+                # Remove URL mapping
+                if url_hash in self.url_to_stream_id:
+                    del self.url_to_stream_id[url_hash]
+
+                # Remove from active streams
                 del self.active_streams[stream_id]
 
+                # Remove subscribers
+                if stream_id in self.stream_subscribers:
+                    del self.stream_subscribers[stream_id]
+
         # Cleanup directory
-        stream_dir = Path(TEMP_DIR) / str(stream_id)
+        stream_dir = Path(TEMP_DIR) / stream_id
         if stream_dir.exists():
             try:
                 import shutil
@@ -116,93 +201,231 @@ class StreamConverter:
             except Exception as e:
                 logger.warning(f"Could not cleanup {stream_dir}: {e}")
 
-    def get_stream_info(self, stream_id):
-        """Get info about active stream"""
-        with self.lock:
-            return self.active_streams.get(stream_id)
-
-    def stop_stream(self, stream_id):
-        """Stop a stream conversion"""
-        with self.lock:
+    async def update_activity(self, stream_id: str, client_id: Optional[str] = None):
+        """Update last activity time for a stream"""
+        async with self.lock:
             if stream_id in self.active_streams:
-                process = self.active_streams[stream_id]["process"]
-                process.terminate()
-                process.wait(timeout=5)
-                del self.active_streams[stream_id]
+                self.active_streams[stream_id]["last_activity"] = time.time()
+                self.active_streams[stream_id]["request_count"] += 1
+
+                # Add client to subscribers if provided
+                if client_id and stream_id in self.stream_subscribers:
+                    self.stream_subscribers[stream_id].add(client_id)
+                    self.active_streams[stream_id]["subscriber_count"] = len(
+                        self.stream_subscribers[stream_id]
+                    )
+
+                logger.debug(f"Activity updated for stream {stream_id}")
                 return True
         return False
 
-    def cleanup_old_streams(self, max_age=600):
-        """Clean up old streams"""
-        with self.lock:
+    async def get_stream_info(self, stream_id: str) -> Optional[dict]:
+        """Get info about active stream"""
+        async with self.lock:
+            return self.active_streams.get(stream_id)
+
+    async def stop_stream(self, stream_id: str, reason: str = "manual"):
+        """Stop a stream conversion"""
+        async with self.lock:
+            if stream_id not in self.active_streams:
+                return False
+
+            info = self.active_streams[stream_id]
+            process = info["process"]
+            url_hash = info["url_hash"]
+
+            logger.info(f"Stopping stream {stream_id} (reason: {reason}, "
+                        f"requests: {info['request_count']}, "
+                        f"subscribers: {info.get('subscriber_count', 0)}, "
+                        f"age: {time.time() - info['start_time']:.1f}s)")
+
+            try:
+                # Send SIGTERM
+                process.terminate()
+
+                # Wait for graceful shutdown
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Force killing stream {stream_id}")
+                    process.kill()
+                    await process.wait()
+            except Exception as e:
+                logger.error(f"Error stopping stream {stream_id}: {e}")
+
+            # Remove URL mapping
+            if url_hash in self.url_to_stream_id:
+                del self.url_to_stream_id[url_hash]
+
+            # Remove from active streams
+            del self.active_streams[stream_id]
+
+            # Remove subscribers
+            if stream_id in self.stream_subscribers:
+                del self.stream_subscribers[stream_id]
+
+            return True
+
+    async def cleanup_inactive_streams(self, inactivity_timeout: int = INACTIVITY_TIMEOUT,
+                                       max_age: int = MAX_STREAM_AGE):
+        """Clean up inactive and old streams"""
+        to_remove = []
+
+        async with self.lock:
             current_time = time.time()
-            to_remove = []
 
             for stream_id, info in self.active_streams.items():
-                if current_time - info["start_time"] > max_age:
-                    to_remove.append(stream_id)
+                age = current_time - info["start_time"]
+                inactive_time = current_time - info["last_activity"]
 
-            for stream_id in to_remove:
-                self.stop_stream(stream_id)
-                logger.info(f"Cleaned up old stream {stream_id}")
+                # Check if process is still alive
+                if info["process"].returncode is not None:
+                    to_remove.append((stream_id, "process_died"))
+                    continue
+
+                # Check max age
+                if age > max_age:
+                    to_remove.append((stream_id, f"max_age_exceeded ({age:.1f}s)"))
+                    continue
+
+                # Check inactivity
+                if inactive_time > inactivity_timeout:
+                    to_remove.append((stream_id, f"inactive ({inactive_time:.1f}s)"))
+                    continue
+
+        # Stop streams outside the lock to avoid deadlock
+        for stream_id, reason in to_remove:
+            await self.stop_stream(stream_id, reason)
+
+    async def get_statistics(self) -> list:
+        """Get statistics about all streams"""
+        async with self.lock:
+            stats = []
+            current_time = time.time()
+
+            for stream_id, info in self.active_streams.items():
+                stats.append({
+                    "stream_id": stream_id,
+                    "age": current_time - info["start_time"],
+                    "inactive_for": current_time - info["last_activity"],
+                    "request_count": info["request_count"],
+                    "subscriber_count": info.get("subscriber_count", 0),
+                    "alive": info["process"].returncode is None,
+                    "url_hash": info["url_hash"]
+                })
+
+            return stats
+
+    async def cleanup_orphaned_directories(self):
+        """Clean up orphaned directories from previous runs"""
+        logger.info("Cleaning up orphaned directories...")
+
+        temp_path = Path(TEMP_DIR)
+        if not temp_path.exists():
+            return
+
+        cleaned = 0
+        for item in temp_path.iterdir():
+            if item.is_dir():
+                stream_id = item.name
+
+                # Check if this stream is active
+                async with self.lock:
+                    if stream_id not in self.active_streams:
+                        try:
+                            import shutil
+                            shutil.rmtree(item)
+                            cleaned += 1
+                            logger.info(f"Removed orphaned directory: {stream_id}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove orphaned directory {item}: {e}")
+
+        if cleaned > 0:
+            logger.info(f"Cleaned up {cleaned} orphaned directories")
+
+    async def shutdown_all_streams(self):
+        """Gracefully shutdown all active streams"""
+        logger.info("Shutting down all streams...")
+
+        stream_ids = list(self.active_streams.keys())
+
+        for stream_id in stream_ids:
+            await self.stop_stream(stream_id, reason="shutdown")
+
+        logger.info(f"Shutdown complete. Stopped {len(stream_ids)} streams.")
 
 
 # Global converter instance
 converter = StreamConverter()
 
 
-# Start cleanup thread
-def cleanup_thread():
-    while True:
-        time.sleep(CLEANUP_INTERVAL)
-        converter.cleanup_old_streams()
+async def cleanup_task():
+    """Background task to clean up inactive streams"""
+    while not converter.shutdown_event.is_set():
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL)
+            logger.debug("Running cleanup check...")
+            await converter.cleanup_inactive_streams()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
 
 
-threading.Thread(target=cleanup_thread, daemon=True).start()
-
-
-@app.route("/convert", methods=["POST"])
-def convert_stream():
+async def convert_stream(request):
     """Start converting a DASH stream to HLS"""
-    data = request.json
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
 
     if not data or "dash_url" not in data:
-        return jsonify({"error": "Missing dash_url"}), 400
+        return web.json_response({"error": "Missing dash_url"}, status=400)
 
     dash_url = data["dash_url"]
-    stream_id = str(uuid.uuid4())[:8]
+    client_id = data.get("client_id")  # Optional client identifier
 
-    # Start conversion
-    stream_dir = converter.convert_to_hls(stream_id, dash_url)
+    # Start conversion (with deduplication)
+    result = await converter.convert_to_hls(dash_url, client_id)
 
-    if not stream_dir:
-        return jsonify({"error": "Failed to start conversion"}), 500
+    if not result or result[0] is None:
+        return web.json_response({"error": "Failed to start conversion"}, status=500)
+
+    stream_id, is_new = result
 
     # Return HLS playlist URL
     hls_playlist_url = f"/hls/{stream_id}/index.m3u8"
 
-    return jsonify({
+    return web.json_response({
         "stream_id": stream_id,
         "hls_url": hls_playlist_url,
-        "status": "converting"
+        "status": "converting",
+        "is_new_stream": is_new
     })
 
 
-@app.route("/hls/<stream_id>/index.m3u8")
-def get_hls_playlist(stream_id):
+async def get_hls_playlist(request):
     """Serve HLS playlist"""
-    stream_info = converter.get_stream_info(stream_id)
+    stream_id = request.match_info['stream_id']
+    client_id = request.query.get('client_id')
+
+    # Update activity tracking
+    await converter.update_activity(stream_id, client_id)
+
+    stream_info = await converter.get_stream_info(stream_id)
 
     if not stream_info:
         # Check if playlist exists (might be cached)
         playlist_path = Path(TEMP_DIR) / stream_id / "index.m3u8"
 
         if not playlist_path.exists():
-            return jsonify({"error": "Stream not found or expired"}), 404
+            return web.json_response({"error": "Stream not found or expired"}, status=404)
+    else:
+        playlist_path = stream_info["dir"] / "index.m3u8"
 
     try:
-        with open(playlist_path, "r") as f:
-            playlist_content = f.read()
+        async with aiofiles.open(playlist_path, "r") as f:
+            playlist_content = await f.read()
 
         # Update URLs in playlist to point to our service
         playlist_content = playlist_content.replace(
@@ -210,71 +433,151 @@ def get_hls_playlist(stream_id):
             f"/hls/{stream_id}/segment_"
         )
 
-        response = Response(playlist_content, mimetype="application/vnd.apple.mpegurl")
-        response.headers["Cache-Control"] = "no-cache"
-        return response
+        return web.Response(
+            text=playlist_content,
+            content_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-cache"}
+        )
 
     except Exception as e:
         logger.error(f"Error serving playlist for {stream_id}: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
-@app.route("/hls/<stream_id>/<segment>")
-def get_hls_segment(stream_id, segment):
+async def get_hls_segment(request):
     """Serve HLS segment (.ts file)"""
+    stream_id = request.match_info['stream_id']
+    segment = request.match_info['segment']
+    client_id = request.query.get('client_id')
+
+    # Validate segment name to prevent path traversal
+    if not segment.endswith('.ts') or '/' in segment or '\\' in segment or '..' in segment:
+        return web.json_response({"error": "Invalid segment name"}, status=400)
+
+    # Update activity tracking
+    await converter.update_activity(stream_id, client_id)
+
     segment_path = Path(TEMP_DIR) / stream_id / segment
 
     if not segment_path.exists():
-        return jsonify({"error": "Segment not found"}), 404
+        return web.json_response({"error": "Segment not found"}, status=404)
 
     try:
-        with open(segment_path, "rb") as f:
-            segment_data = f.read()
+        async with aiofiles.open(segment_path, "rb") as f:
+            segment_data = await f.read()
 
-        response = Response(segment_data, mimetype="video/MP2T")
-        response.headers["Cache-Control"] = "max-age=3600"
-        return response
+        return web.Response(
+            body=segment_data,
+            content_type="video/MP2T",
+            headers={"Cache-Control": "max-age=3600"}
+        )
 
     except Exception as e:
         logger.error(f"Error serving segment {segment}: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
-@app.route("/streams")
-def list_streams():
-    """List active streams"""
-    streams = []
+async def list_streams(request):
+    """List active streams with detailed statistics"""
+    stats = await converter.get_statistics()
 
-    with converter.lock:
-        for stream_id, info in converter.active_streams.items():
-            streams.append({
-                "stream_id": stream_id,
-                "age": time.time() - info["start_time"],
-                "dash_url": info["dash_url"],
-                "alive": info["process"].poll() is None
-            })
+    return web.json_response({
+        "streams": stats,
+        "total": len(stats),
+        "config": {
+            "inactivity_timeout": INACTIVITY_TIMEOUT,
+            "max_stream_age": MAX_STREAM_AGE,
+            "cleanup_interval": CLEANUP_INTERVAL,
+            "max_streams": MAX_STREAMS
+        }
+    })
 
-    return jsonify({"streams": streams, "total": len(streams)})
 
-
-@app.route("/streams/<stream_id>", methods=["DELETE"])
-def stop_stream(stream_id):
+async def stop_stream_handler(request):
     """Stop a stream"""
-    if converter.stop_stream(stream_id):
-        return jsonify({"status": "stopped"})
+    stream_id = request.match_info['stream_id']
+
+    if await converter.stop_stream(stream_id, reason="api_request"):
+        return web.json_response({"status": "stopped"})
     else:
-        return jsonify({"error": "Stream not found"}), 404
+        return web.json_response({"error": "Stream not found"}, status=404)
 
 
-@app.route("/health")
-def health():
+async def health(request):
     """Health check"""
-    return jsonify({
+    return web.json_response({
         "status": "healthy",
         "active_streams": len(converter.active_streams),
+        "unique_sources": len(converter.url_to_stream_id),
         "temp_dir_size": sum(f.stat().st_size for f in Path(TEMP_DIR).rglob('*') if f.is_file())
     })
 
 
+async def on_startup(app):
+    """Startup tasks"""
+    logger.info("Starting HLS Converter Service...")
+
+    # Clean up orphaned directories from previous runs
+    await converter.cleanup_orphaned_directories()
+
+    # Start cleanup task
+    app['cleanup_task'] = asyncio.create_task(cleanup_task())
+
+    logger.info("HLS Converter Service started successfully")
+
+
+async def on_shutdown(app):
+    """Shutdown tasks"""
+    logger.info("Shutting down HLS Converter Service...")
+
+    # Signal shutdown
+    converter.shutdown_event.set()
+
+    # Cancel cleanup task
+    if 'cleanup_task' in app:
+        app['cleanup_task'].cancel()
+        try:
+            await app['cleanup_task']
+        except asyncio.CancelledError:
+            pass
+
+    # Shutdown all streams
+    await converter.shutdown_all_streams()
+
+    logger.info("HLS Converter Service shutdown complete")
+
+
+def handle_signal(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    sys.exit(0)
+
+
+def create_app():
+    """Create and configure the application"""
+    app = web.Application()
+
+    # Add routes
+    app.router.add_post('/convert', convert_stream)
+    app.router.add_get('/hls/{stream_id}/index.m3u8', get_hls_playlist)
+    app.router.add_get('/hls/{stream_id}/{segment}', get_hls_segment)
+    app.router.add_get('/streams', list_streams)
+    app.router.add_delete('/streams/{stream_id}', stop_stream_handler)
+    app.router.add_get('/health', health)
+
+    # Add startup/shutdown handlers
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    return app
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    app = create_app()
+
+    logger.info("Starting server on 0.0.0.0:8000")
+    web.run_app(app, host="0.0.0.0", port=8000)
