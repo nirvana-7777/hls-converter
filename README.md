@@ -1,18 +1,19 @@
-# HLS Converter Service
+# MPEG-TS Stream Proxy
 
-Convert DASH (MPD) streams to HLS (M3U8/TS) format on-the-fly.
+Convert DASH (MPD) streams to MPEG-TS format on-the-fly for direct streaming.
 
 [![Docker Build](https://github.com/YOUR_USERNAME/YOUR_REPO/actions/workflows/docker-build.yml/badge.svg)](https://github.com/YOUR_USERNAME/YOUR_REPO/actions/workflows/docker-build.yml)
 [![Docker Pulls](https://img.shields.io/docker/pulls/nirvana777/hls-converter)](https://hub.docker.com/r/nirvana777/hls-converter)
 
 ## Features
 
-- 🎥 Real-time DASH to HLS conversion
-- 🚀 FFmpeg-based transcoding (copy mode - no re-encoding)
-- 🧹 Automatic cleanup of old streams
-- 📊 Health monitoring and stream management API
-- 🔧 RESTful API for easy integration
-- 🐳 Docker ready
+- 🎥 Real-time DASH to MPEG-TS conversion
+- 🚀 FFmpeg-based streaming (copy mode - no re-encoding)
+- 🧹 Automatic cleanup of dead/stale streams
+- 📊 Health monitoring with stream statistics
+- 🔒 Resource limits (max streams, max age)
+- 🔄 Smart stream reuse (same URL shares FFmpeg process)
+- 🐳 Docker ready (Alpine-based, small footprint)
 
 ## Quick Start
 
@@ -22,9 +23,8 @@ Convert DASH (MPD) streams to HLS (M3U8/TS) format on-the-fly.
 docker pull nirvana777/hls-converter:latest
 
 docker run -d \
-  --name hls-converter \
+  --name mpegts-proxy \
   -p 8000:8000 \
-  -v /tmp/hls_segments:/tmp/hls_segments \
   nirvana777/hls-converter:latest
 ```
 
@@ -34,20 +34,26 @@ docker run -d \
 version: '3.8'
 
 services:
-  hls-converter:
+  mpegts-proxy:
     image: nirvana777/hls-converter:latest
+    container_name: mpegts-proxy
     ports:
       - "8000:8000"
-    volumes:
-      - hls_segments:/tmp/hls_segments
     restart: unless-stopped
-    environment:
-      - HLS_SEGMENT_DURATION=2
-      - HLS_LIST_SIZE=5
-      - CLEANUP_INTERVAL=300
-
-volumes:
-  hls_segments:
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 ```
 
 ### Local Development
@@ -64,51 +70,28 @@ pip install -r requirements.txt
 sudo apt-get install ffmpeg
 
 # Run service
-python hls-converter.py
+python mpegts-proxy.py
 ```
 
 ## API Usage
 
-### Convert a DASH Stream
+### Stream a DASH URL
 
 ```bash
-curl -X POST http://localhost:8000/convert \
-  -H "Content-Type: application/json" \
-  -d '{
-    "dash_url": "https://example.com/stream.mpd"
-  }'
+# Direct streaming (outputs MPEG-TS)
+curl "http://localhost:8000/stream?url=https://example.com/stream.mpd&name=MyStream" > output.ts
+
+# Use in media player (VLC, ffplay, etc.)
+vlc "http://localhost:8000/stream?url=https://example.com/stream.mpd"
+ffplay "http://localhost:8000/stream?url=https://example.com/stream.mpd"
 ```
 
-Response:
-```json
-{
-  "stream_id": "a1b2c3d4",
-  "hls_url": "/hls/a1b2c3d4/index.m3u8",
-  "status": "converting"
-}
-```
+### Parameters
 
-### Play the HLS Stream
-
-```bash
-# Get HLS playlist
-curl http://localhost:8000/hls/a1b2c3d4/index.m3u8
-
-# Use in video player
-# http://localhost:8000/hls/a1b2c3d4/index.m3u8
-```
-
-### List Active Streams
-
-```bash
-curl http://localhost:8000/streams
-```
-
-### Stop a Stream
-
-```bash
-curl -X DELETE http://localhost:8000/streams/a1b2c3d4
-```
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `url` | Yes | DASH manifest URL (.mpd) |
+| `name` | No | Stream name for metadata (default: "Stream") |
 
 ### Health Check
 
@@ -116,95 +99,190 @@ curl -X DELETE http://localhost:8000/streams/a1b2c3d4
 curl http://localhost:8000/health
 ```
 
+Response:
+```json
+{
+  "status": "healthy",
+  "streams": 2,
+  "max_streams": 10,
+  "stream_details": [
+    {
+      "id": "a1b2c3d4",
+      "age": 120,
+      "clients": 2,
+      "alive": true
+    }
+  ]
+}
+```
+
 ## Configuration
 
-Environment variables:
+Configuration is done via code constants in `mpegts-proxy.py`:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HLS_SEGMENT_DURATION` | `2` | Segment duration in seconds |
-| `HLS_LIST_SIZE` | `5` | Number of segments in playlist |
-| `CLEANUP_INTERVAL` | `300` | Cleanup interval in seconds |
-| `MAX_STREAMS` | `10` | Maximum concurrent streams |
-| `TEMP_DIR` | `/tmp/hls_segments` | Directory for HLS segments |
+```python
+manager = StreamManager(
+    max_streams=10,      # Maximum concurrent streams
+    max_stream_age=3600  # Maximum stream lifetime (1 hour)
+)
+```
+
+Cleanup intervals (in `StreamManager._cleanup_loop`):
+- **Cleanup frequency**: 30 seconds
+- **Idle timeout**: 300 seconds (5 minutes)
 
 ## Architecture
 
 ```
-┌─────────┐
-│ Client  │
-└────┬────┘
-     │
-     ▼
-┌──────────────┐     ┌──────────┐
-│ Flask API    │────▶│  FFmpeg  │
-│ (Port 8000)  │     │ Process  │
-└──────────────┘     └──────────┘
-     │                     │
-     ▼                     ▼
-┌──────────────────────────────┐
-│   /tmp/hls_segments/         │
-│   ├── stream1/               │
-│   │   ├── index.m3u8         │
-│   │   ├── segment_000.ts     │
-│   │   └── segment_001.ts     │
-│   └── stream2/               │
-└──────────────────────────────┘
+┌─────────┐                                    ┌──────────┐
+│ Client  │───── HTTP GET /stream?url=... ────▶│  aiohttp │
+└─────────┘                                    │   API    │
+     │                                         └──────────┘
+     │                                              │
+     │  ◄─── MPEG-TS Stream ───                    │
+     │                                              ▼
+     │                                         ┌──────────┐
+     └─────────────────────────────────────────│  FFmpeg  │
+                                               │ Process  │
+                                               └──────────┘
+                                                    │
+                                                    ▼
+                                            ┌───────────────┐
+                                            │  DASH Source  │
+                                            │  (.mpd URL)   │
+                                            └───────────────┘
+
+Key Features:
+• Stream Reuse: Same URL = same FFmpeg process (multiple clients)
+• Auto Cleanup: Dead/idle/old streams removed every 30s
+• Process Monitoring: Health checks on FFmpeg processes
+• Resource Limits: Max 10 concurrent streams (configurable)
 ```
+
+## How It Works
+
+1. **Client requests stream** → `/stream?url=<mpd_url>`
+2. **Proxy checks** if stream already exists for this URL
+3. **If exists**: Reuses existing FFmpeg process (increments client count)
+4. **If new**: Creates FFmpeg process with MPEG-TS output to stdout
+5. **Streams data** → Reads from FFmpeg stdout, writes to HTTP response
+6. **Background cleanup** → Every 30s, removes:
+   - Dead FFmpeg processes
+   - Streams older than 1 hour
+   - Streams idle for 5+ minutes (no clients)
+7. **Client disconnect** → Decrements client count
+8. **No clients** → Stream marked for cleanup after 5 min idle
 
 ## Performance Tips
 
-1. **Memory Management**: Each stream uses ~50-200MB. Monitor with `/health` endpoint
-2. **Concurrent Streams**: Default limit is 10. Adjust `MAX_STREAMS` based on your resources
-3. **Storage**: Segments are automatically cleaned up. Configure `CLEANUP_INTERVAL` as needed
-4. **Network**: Use CDN or Nginx for production to offload static file serving
+1. **Memory**: Each stream uses ~50-100MB. Monitor with `/health`
+2. **Concurrent streams**: Default 10, adjust `max_streams` for your hardware
+3. **Stream reuse**: Multiple clients can watch the same URL efficiently
+4. **CPU**: FFmpeg uses copy mode (no transcoding), minimal CPU usage
+5. **Network**: Outbound bandwidth = (stream bitrate × active clients)
 
 ## Monitoring
 
-Check active streams and resource usage:
-
+### Check service health
 ```bash
-# Health endpoint shows active streams and disk usage
-curl http://localhost:8000/health
+curl http://localhost:8000/health | jq
+```
 
-# List all active conversions
-curl http://localhost:8000/streams
+### Watch FFmpeg logs
+```bash
+# Container logs show stream lifecycle
+docker logs -f mpegts-proxy
+```
+
+### Resource usage
+```bash
+# Inside container
+docker exec mpegts-proxy ps aux
+docker stats mpegts-proxy
 ```
 
 ## Troubleshooting
 
-### FFmpeg not found
-```bash
-# Install FFmpeg in container
-docker exec -it hls-converter apt-get update && apt-get install -y ffmpeg
-```
+### Stream won't start
+- **Check URL**: Verify DASH manifest is accessible
+- **Check logs**: `docker logs mpegts-proxy` for FFmpeg errors
+- **Network**: Ensure container can reach external URLs
+
+### "Max streams reached" (503 error)
+- Increase `max_streams` in code
+- Check `/health` to see if streams are stuck
+- Wait for cleanup (runs every 30s)
+
+### Stream stops unexpectedly
+- FFmpeg process may have crashed (check logs)
+- Source stream may have ended
+- Stream exceeded max age (1 hour default)
 
 ### High memory usage
-- Reduce `MAX_STREAMS`
-- Decrease `HLS_LIST_SIZE`
-- Increase `CLEANUP_INTERVAL`
+- Reduce `max_streams`
+- Check for stuck streams in `/health`
+- Restart container to clear all streams
 
-### Segments not playing
-- Check FFmpeg logs in container: `docker logs hls-converter`
-- Verify DASH URL is accessible
-- Ensure correct MIME types are set
+### No cleanup happening
+- Background cleanup task runs every 30s automatically
+- Check logs for "Started stream cleanup task"
+- Verify app is running (not just FFmpeg processes)
+
+## Differences from HLS Converter
+
+This is **not** an HLS converter. Key differences:
+
+| Feature | MPEG-TS Proxy | HLS Converter |
+|---------|---------------|---------------|
+| Output format | MPEG-TS stream | HLS playlist + segments |
+| Storage | No disk storage | Requires disk for segments |
+| Volumes | None needed | `/tmp/hls_segments` required |
+| API | Simple GET endpoint | POST to convert, GET playlist |
+| Use case | Direct streaming | CDN distribution |
+| Latency | Real-time | Segment duration delay |
+
+## Use Cases
+
+✅ **Good for:**
+- Direct streaming to media players (VLC, ffplay)
+- Low-latency proxy for DASH sources
+- Simple DASH → MPEG-TS conversion
+- Temporary stream access (no recording)
+
+❌ **Not for:**
+- HLS playlist generation
+- CDN distribution
+- DVR/recording functionality
+- Multiple quality levels
 
 ## GitHub Actions
 
-This repository includes automated CI/CD:
+Automated CI/CD pipeline:
 
-- ✅ Automated testing on push
-- 🐳 Multi-platform Docker builds (amd64, arm64)
+- ✅ Testing with FFmpeg validation
+- 🐳 Multi-platform builds (amd64, arm64)
 - 🔒 Security scanning with Trivy
-- 📦 Automatic push to Docker Hub
-- 🏷️ Semantic versioning support
+- 📦 Auto-push to Docker Hub
+- 🏷️ Semantic versioning
 
 ### Required Secrets
 
-Set these in your GitHub repository settings:
+Set in GitHub repository settings:
 
-- `DOCKERHUB_USERNAME`: Your Docker Hub username
+- `DOCKERHUB_USERNAME`: Docker Hub username
 - `DOCKERHUB_TOKEN`: Docker Hub access token
+
+## Roadmap
+
+Potential improvements:
+
+- [ ] Authentication/API keys
+- [ ] Rate limiting per IP
+- [ ] Configuration via environment variables
+- [ ] Prometheus metrics endpoint
+- [ ] Stream quality/bitrate selection
+- [ ] Input URL validation (prevent SSRF)
+- [ ] Configurable timeout on FFmpeg startup
 
 ## License
 
@@ -212,9 +290,10 @@ MIT
 
 ## Contributing
 
-Pull requests welcome! Please ensure:
-- Tests pass
-- Code follows existing style
+Pull requests welcome! Ensure:
+- Code follows existing async patterns
+- Add logging for new features
+- Test with actual DASH streams
 - Docker build succeeds
 
 ## Support

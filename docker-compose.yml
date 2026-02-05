@@ -1,29 +1,22 @@
 version: '3.8'
 
 services:
-  hls-converter:
+  mpegts-proxy:
     image: nirvana777/hls-converter:latest
-    container_name: hls-converter
+    container_name: mpegts-proxy
     ports:
       - "8000:8000"
-    volumes:
-      - hls_segments:/tmp/hls_segments
-    environment:
-      # Segment duration in seconds
-      - HLS_SEGMENT_DURATION=2
-      # Number of segments to keep in playlist
-      - HLS_LIST_SIZE=5
-      # Cleanup interval in seconds
-      - CLEANUP_INTERVAL=300
-      # Maximum concurrent streams
-      - MAX_STREAMS=10
     restart: unless-stopped
+
+    # Health check using wget (available in Alpine)
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 10s
+
+    # Resource limits
     deploy:
       resources:
         limits:
@@ -33,6 +26,12 @@ services:
           cpus: '0.5'
           memory: 512M
 
-volumes:
-  hls_segments:
-    driver: local
+    # Optional: Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Note: No volumes needed - this is a streaming proxy with no persistent storage
+# Configuration is done in code (max_streams, max_stream_age, etc.)
