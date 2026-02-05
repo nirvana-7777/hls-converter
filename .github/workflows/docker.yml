@@ -1,4 +1,4 @@
-name: Docker Build and Publish - HLS Converter
+name: Docker Build and Publish - MPEGTS Proxy
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 
 env:
   DOCKER_IMAGE: nirvana777/hls-converter
-  PYTHON_VERSION: '3.9'
+  PYTHON_VERSION: '3.11'  # Changed from 3.9 to match Dockerfile
 
 jobs:
   test:
@@ -33,7 +33,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-flask pytest-cov flake8
+          pip install pytest pytest-aiohttp pytest-cov flake8  # Changed pytest-flask to pytest-aiohttp
 
       - name: Lint with flake8
         run: |
@@ -51,16 +51,23 @@ jobs:
       - name: Run tests
         run: |
           # Add your test commands here when you have tests
-          # Example: python -m pytest tests/ -v --cov=hls-converter
+          # Example: python -m pytest tests/ -v --cov=mpegts-proxy
           echo "⚠️  No tests configured yet"
           echo "✓ Basic validation passed"
 
-      - name: Test Flask app startup
+      - name: Test aiohttp app startup
         run: |
-          timeout 10 python hls-converter.py &
+          # Start the app in background with timeout
+          timeout 10 python mpegts-proxy.py &  # Changed from hls-converter.py
+          APP_PID=$!
           sleep 5
+          
+          # Test health endpoint
           curl -f http://localhost:8000/health || exit 1
           echo "✓ Health check passed"
+          
+          # Kill the app
+          kill $APP_PID 2>/dev/null || true
 
   docker:
     needs: test
@@ -122,7 +129,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKER_IMAGE }}
-          short-description: "HLS Converter - Convert DASH (MPD) to HLS (M3U8/TS) streams on-the-fly"
+          short-description: "MPEG-TS Stream Proxy - Convert DASH (MPD) to MPEG-TS streams on-the-fly"  # Updated description
         continue-on-error: true
 
   security-scan:
@@ -178,5 +185,5 @@ jobs:
       #     webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
       #     payload: |
       #       {
-      #         "text": "HLS Converter build ${{ needs.docker.result }}: ${{ github.sha }}"
+      #         "text": "MPEG-TS Proxy build ${{ needs.docker.result }}: ${{ github.sha }}"
       #       }

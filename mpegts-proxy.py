@@ -4,12 +4,13 @@ Minimal MPEG-TS Stream Proxy
 Direct DASH → MPEG-TS streaming with process monitoring and resource management
 """
 
-from aiohttp import web
 import asyncio
 import hashlib
-import time
 import logging
 import subprocess
+import time
+
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,24 +44,26 @@ class StreamManager:
         streams_to_remove = []
 
         for stream_id, info in list(self.streams.items()):
-            proc = info['process']
+            proc = info["process"]
 
             # Check if process has died
             if proc.returncode is not None:
-                logger.info(f"Stream {stream_id} process died (exit code: {proc.returncode})")
+                logger.info(
+                    f"Stream {stream_id} process died (exit code: {proc.returncode})"
+                )
                 streams_to_remove.append(stream_id)
                 continue
 
             # Check if stream is too old
-            age = now - info['created']
+            age = now - info["created"]
             if age > self.max_stream_age:
                 logger.info(f"Stream {stream_id} exceeded max age ({age:.0f}s)")
                 streams_to_remove.append(stream_id)
                 continue
 
             # Check if no clients are connected
-            if info.get('client_count', 0) == 0:
-                idle_time = now - info.get('last_client_disconnect', info['created'])
+            if info.get("client_count", 0) == 0:
+                idle_time = now - info.get("last_client_disconnect", info["created"])
                 if idle_time > 300:  # 5 minutes idle
                     logger.info(f"Stream {stream_id} idle for {idle_time:.0f}s")
                     streams_to_remove.append(stream_id)
@@ -75,7 +78,7 @@ class StreamManager:
             return
 
         info = self.streams[stream_id]
-        proc = info['process']
+        proc = info["process"]
 
         try:
             # Try graceful termination first
@@ -113,12 +116,12 @@ class StreamManager:
         # Check if stream exists and is still healthy
         if stream_id in self.streams:
             info = self.streams[stream_id]
-            proc = info['process']
+            proc = info["process"]
 
             # Verify process is still running
             if proc.returncode is None:
                 logger.info(f"Reusing healthy stream {stream_id}")
-                info['client_count'] = info.get('client_count', 0) + 1
+                info["client_count"] = info.get("client_count", 0) + 1
                 return stream_id
             else:
                 # Process died, clean it up
@@ -131,31 +134,45 @@ class StreamManager:
             return None
 
         cmd = [
-            'ffmpeg', '-loglevel', 'fatal',
-            '-fflags', '+genpts+discardcorrupt',
-            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
-            '-i', url,
-            '-map', '0:v', '-map', '0:a?',
-            '-c', 'copy',
-            '-bsf:v', 'h264_mp4toannexb',
-            '-f', 'mpegts',
-            '-metadata', f'service_name={name}',
-            'pipe:1'
+            "ffmpeg",
+            "-loglevel",
+            "fatal",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "2",
+            "-i",
+            url,
+            "-map",
+            "0:v",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-bsf:v",
+            "h264_mp4toannexb",
+            "-f",
+            "mpegts",
+            "-metadata",
+            f"service_name={name}",
+            "pipe:1",
         ]
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
 
             self.streams[stream_id] = {
-                'process': proc,
-                'url': url,
-                'created': time.time(),
-                'client_count': 1,
-                'last_client_disconnect': None
+                "process": proc,
+                "url": url,
+                "created": time.time(),
+                "client_count": 1,
+                "last_client_disconnect": None,
             }
 
             # Start draining stderr to prevent blocking
@@ -172,9 +189,9 @@ class StreamManager:
         """Mark a client as disconnected from a stream"""
         if stream_id in self.streams:
             info = self.streams[stream_id]
-            info['client_count'] = max(0, info.get('client_count', 1) - 1)
-            if info['client_count'] == 0:
-                info['last_client_disconnect'] = time.time()
+            info["client_count"] = max(0, info.get("client_count", 1) - 1)
+            if info["client_count"] == 0:
+                info["last_client_disconnect"] = time.time()
                 logger.info(f"Stream {stream_id} has no clients")
 
     async def shutdown(self):
@@ -199,23 +216,22 @@ manager = StreamManager(max_streams=10, max_stream_age=3600)
 
 async def stream_handler(request):
     """Handle stream requests"""
-    url = request.query.get('url')
-    name = request.query.get('name', 'Stream')
+    url = request.query.get("url")
+    name = request.query.get("name", "Stream")
 
     if not url:
-        return web.Response(text='Missing URL', status=400)
+        return web.Response(text="Missing URL", status=400)
 
     stream_id = await manager.create_stream(url, name)
     if not stream_id:
-        return web.Response(text='Stream creation failed or max streams reached', status=503)
+        return web.Response(
+            text="Stream creation failed or max streams reached", status=503
+        )
 
-    proc = manager.streams[stream_id]['process']
+    proc = manager.streams[stream_id]["process"]
 
     response = web.StreamResponse(
-        headers={
-            'Content-Type': 'video/mp2t',
-            'Cache-Control': 'no-cache'
-        }
+        headers={"Content-Type": "video/mp2t", "Cache-Control": "no-cache"}
     )
     await response.prepare(request)
 
@@ -247,20 +263,24 @@ async def health_handler(request):
     """Health check endpoint with stream statistics"""
     stream_info = []
     for stream_id, info in manager.streams.items():
-        proc = info['process']
-        stream_info.append({
-            'id': stream_id,
-            'age': int(time.time() - info['created']),
-            'clients': info.get('client_count', 0),
-            'alive': proc.returncode is None
-        })
+        proc = info["process"]
+        stream_info.append(
+            {
+                "id": stream_id,
+                "age": int(time.time() - info["created"]),
+                "clients": info.get("client_count", 0),
+                "alive": proc.returncode is None,
+            }
+        )
 
-    return web.json_response({
-        'status': 'healthy',
-        'streams': len(manager.streams),
-        'max_streams': manager.max_streams,
-        'stream_details': stream_info
-    })
+    return web.json_response(
+        {
+            "status": "healthy",
+            "streams": len(manager.streams),
+            "max_streams": manager.max_streams,
+            "stream_details": stream_info,
+        }
+    )
 
 
 async def on_startup(app):
@@ -274,10 +294,10 @@ async def on_cleanup(app):
 
 
 app = web.Application()
-app.router.add_get('/stream', stream_handler)
-app.router.add_get('/health', health_handler)
+app.router.add_get("/stream", stream_handler)
+app.router.add_get("/health", health_handler)
 app.on_startup.append(on_startup)
 app.on_cleanup.append(on_cleanup)
 
-if __name__ == '__main__':
-    web.run_app(app, host='0.0.0.0', port=8000)
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=8000)
