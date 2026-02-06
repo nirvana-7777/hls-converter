@@ -147,8 +147,6 @@ class StreamManager:
             "0:a?",
             "-c",
             "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
             "-f",
             "mpegts",
             "-metadata",
