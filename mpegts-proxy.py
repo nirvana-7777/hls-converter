@@ -231,7 +231,19 @@ async def stream_handler(request):
                 else:
                     chunk = await proc.stdout.read(65536)
             except asyncio.TimeoutError:
-                logger.error(f"Stream {stream_id} timeout waiting for FFmpeg data (>5s)")
+                # Read any stderr output to see why FFmpeg failed
+                stderr_data = b""
+                try:
+                    while True:
+                        line = await asyncio.wait_for(proc.stderr.readline(), timeout=0.1)
+                        if not line:
+                            break
+                        stderr_data += line
+                except asyncio.TimeoutError:
+                    pass
+
+                error_msg = stderr_data.decode().strip() if stderr_data else "no error output"
+                logger.error(f"Stream {stream_id} timeout waiting for FFmpeg data (>5s), FFmpeg says: {error_msg}")
                 break
 
             if not chunk:
