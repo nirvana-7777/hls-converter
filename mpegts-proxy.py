@@ -97,7 +97,7 @@ class StreamManager:
             del self.streams[stream_id]
 
     async def _drain_stderr(self, proc, stream_id):
-        """Continuously read stderr to prevent blocking"""
+        """Continuously read stderr to prevent blocking and log errors"""
         try:
             while True:
                 line = await proc.stderr.readline()
@@ -105,38 +105,32 @@ class StreamManager:
                     break
                 msg = line.decode().strip()
                 if msg:
-                    logger.debug(f"FFmpeg [{stream_id}]: {msg}")
+                    # Log FFmpeg errors at warning level so we can see what's wrong
+                    logger.warning(f"FFmpeg [{stream_id}]: {msg}")
         except Exception as e:
             logger.debug(f"stderr drain ended for {stream_id}: {e}")
 
     async def create_stream(self, url, name="Stream"):
-        """Create a new stream or reuse existing one"""
+        """Create a new stream - each client gets own FFmpeg process"""
         stream_id = self.get_stream_id(url)
 
-        # Check if stream exists and is still healthy
-        if stream_id in self.streams:
-            info = self.streams[stream_id]
-            proc = info["process"]
-
-            # Verify process is still running
-            if proc.returncode is None:
-                logger.info(f"Reusing healthy stream {stream_id}")
-                info["client_count"] = info.get("client_count", 0) + 1
-                return stream_id
-            else:
-                # Process died, clean it up
-                logger.warning(f"Existing stream {stream_id} is dead, recreating")
-                await self._terminate_stream(stream_id)
+        # DON'T reuse streams - each client needs own FFmpeg process
+        # Multiple clients cannot read from same stdout pipe
 
         # Check resource limits
         if len(self.streams) >= self.max_streams:
             logger.warning(f"Max streams ({self.max_streams}) reached")
             return None
 
+        # Generate unique stream ID for this instance
+        import uuid
+
+        unique_id = f"{stream_id}_{uuid.uuid4().hex[:6]}"
+
         cmd = [
             "ffmpeg",
             "-loglevel",
-            "fatal",
+            "error",  # Changed to 'error' to see why FFmpeg fails
             "-fflags",
             "+genpts+discardcorrupt",
             "-reconnect",
@@ -167,7 +161,18 @@ class StreamManager:
                 *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
 
-            self.streams[stream_id] = {
+            # Wait briefly to ensure FFmpeg actually starts
+            # If it dies immediately, we can fail fast
+            await asyncio.sleep(0.5)
+
+            if proc.returncode is not None:
+                # FFmpeg died immediately during startup
+                stderr = await proc.stderr.read()
+                error_msg = stderr.decode().strip() if stderr else "unknown error"
+                logger.error(f"FFmpeg failed to start: {error_msg}")
+                return None
+
+            self.streams[unique_id] = {
                 "process": proc,
                 "url": url,
                 "created": time.time(),
@@ -176,10 +181,12 @@ class StreamManager:
             }
 
             # Start draining stderr to prevent blocking
-            asyncio.create_task(self._drain_stderr(proc, stream_id))
+            asyncio.create_task(self._drain_stderr(proc, unique_id))
 
-            logger.info(f"Created stream {stream_id} (total: {len(self.streams)})")
-            return stream_id
+            logger.info(
+                f"Created stream {unique_id} for URL {url[:50]}... (total: {len(self.streams)})"
+            )
+            return unique_id
 
         except Exception as e:
             logger.error(f"Failed to create stream: {e}")
