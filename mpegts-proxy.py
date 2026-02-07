@@ -278,9 +278,10 @@ async def stream_handler(request):
                 break
 
             try:
-                # Add timeout on first chunk to detect slow startup
+                # Increase timeout for first chunk to allow DASH initialization
                 if first_chunk:
-                    chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=5.0)
+                    # Give FFmpeg up to 30 seconds to start for DASH streams
+                    chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=30.0)
                     if chunk:
                         logger.info(
                             f"Stream {stream_id} started, "
@@ -290,13 +291,15 @@ async def stream_handler(request):
                 else:
                     chunk = await proc.stdout.read(65536)
             except asyncio.TimeoutError:
-                # Just log timeout without trying to read stderr
                 logger.error(
-                    f"Stream {stream_id} timeout waiting for FFmpeg data (>5s)"
+                    f"Stream {stream_id} timeout waiting for FFmpeg data"
                 )
                 break
 
             if not chunk:
+                # No data - check if process is still alive
+                if proc.returncode is not None:
+                    logger.info(f"Stream {stream_id} ended (exit: {proc.returncode})")
                 break
 
             await response.write(chunk)
