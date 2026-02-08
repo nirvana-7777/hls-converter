@@ -163,8 +163,7 @@ class StreamManager:
             # Regular URL - build our own FFmpeg command
             cmd = [
                 "ffmpeg",
-                "-loglevel", "warning",  # Reduced from verbose
-                "-re",  # Read input at native frame rate
+                "-loglevel", "warning",
                 "-fflags", "+genpts+discardcorrupt",
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
@@ -174,8 +173,10 @@ class StreamManager:
                 "-map", "0:a?",
                 "-c", "copy",
                 "-bsf:v", "h264_mp4toannexb",
+                "-avoid_negative_ts", "make_zero",  # Fixes DTS issues
                 "-f", "mpegts",
-                "-flush_packets", "1",  # Also helpful
+                "-flush_packets", "1",
+                "-use_wallclock_as_timestamps", "1",
                 "-metadata", f"service_name={name}",
                 "pipe:1",
             ]
