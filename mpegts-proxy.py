@@ -197,8 +197,6 @@ async def stream_handler(request):
         }
     )
 
-    # TCP_NODELAY helps push small TS packets faster
-    response.set_tcp_nodelay(True)
     await response.prepare(request)
 
     try:
