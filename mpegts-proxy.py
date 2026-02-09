@@ -180,7 +180,7 @@ class StreamManager:
                 "-avoid_negative_ts", "make_non_negative",
                 "-max_interleave_delta", "0",
                 "-f", "mpegts",
-                "-muxdelay", "0",
+                "-muxdelay", "0.1",
                 "-flush_packets", "1",
                 "-use_wallclock_as_timestamps", "1",
                 "-metadata", f"service_name={name}",
