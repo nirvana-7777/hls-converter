@@ -23,6 +23,6 @@ COPY mpegts-proxy.py .
 EXPOSE 8000
 
 # tini is essential for reaping ffmpeg subprocesses
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 CMD ["python", "mpegts-proxy.py"]
