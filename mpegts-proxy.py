@@ -64,6 +64,24 @@ class StreamManager:
         for s_id in streams_to_remove:
             await self._terminate_stream(s_id)
 
+    async def client_disconnected(self, stream_id):
+        """Called when a client disconnects from a stream."""
+        if stream_id not in self.streams:
+            return
+
+        info = self.streams[stream_id]
+        info["client_count"] = max(0, info["client_count"] - 1)
+
+        if info["client_count"] == 0:
+            info["last_client_disconnect"] = time.time()
+            logger.info(
+                f"Last client disconnected from {stream_id}, will cleanup if idle for 60s"
+            )
+        else:
+            logger.info(
+                f"Client disconnected from {stream_id} ({info['client_count']} clients remaining)"
+            )
+
     async def _terminate_stream(self, stream_id):
         if stream_id not in self.streams:
             return
@@ -83,23 +101,52 @@ class StreamManager:
             logger.info(f"Terminated stream {stream_id}")
 
     async def _drain_stderr(self, proc, stream_id):
+        """Monitor FFmpeg stderr for errors"""
         try:
             while True:
                 line = await proc.stderr.readline()
                 if not line:
                     break
                 msg = line.decode().strip()
-                if "Non-monotonic DTS" not in msg:  # Filter noise, keep real errors
-                    logger.warning(f"FFmpeg [{stream_id}]: {msg}")
+                # Filter out common noise, log actual problems
+                if any(
+                    noise in msg
+                    for noise in [
+                        "Non-monotonic DTS",
+                        "Past duration",
+                        "Application provided invalid",
+                    ]
+                ):
+                    continue
+
+                # Log actual errors
+                if any(err in msg for err in ["Error", "Invalid", "Failed", "Cannot"]):
+                    logger.error(f"FFmpeg [{stream_id}]: {msg}")
+                else:
+                    logger.debug(f"FFmpeg [{stream_id}]: {msg}")
         except Exception:
             pass
 
-    async def create_stream(self, url_or_command, name="Stream"):
+    async def get_or_create_stream(self, url_or_command, name="Stream"):
+        """Get existing stream or create new one. Reuses streams for same URL."""
         await self._cleanup_dead_streams()
+
+        stream_id = self.get_stream_id(url_or_command)
+
+        # Check if we already have a running stream for this URL
+        for existing_id, info in list(self.streams.items()):
+            if existing_id.startswith(stream_id) and info["process"].returncode is None:
+                # Reuse existing stream
+                info["client_count"] += 1
+                logger.info(
+                    f"Reusing stream {existing_id} (clients: {info['client_count']})"
+                )
+                return existing_id
+
+        # Need to create new stream
         if len(self.streams) >= self.max_streams:
             return None
 
-        stream_id = self.get_stream_id(url_or_command)
         unique_id = f"{stream_id}_{uuid.uuid4().hex[:6]}"
 
         if url_or_command.startswith("pipe://"):
@@ -108,41 +155,45 @@ class StreamManager:
             cmd = [
                 "ffmpeg",
                 "-loglevel",
-                "warning",
+                "error",  # Only show errors, not warnings
+                "-fflags",
+                "+genpts+igndts",  # Generate PTS, ignore DTS issues
                 "-probesize",
-                "10M",
+                "32M",  # Increased for better format detection
                 "-analyzeduration",
                 "10M",
-                "-fflags",
-                "+genpts+discardcorrupt+igndts+flush_packets",
                 "-reconnect",
                 "1",
                 "-reconnect_streamed",
                 "1",
                 "-reconnect_delay_max",
-                "1",
+                "2",
                 "-i",
                 url_or_command,
                 "-map",
-                "0:v",
+                "0:v:0",  # First video stream
                 "-map",
-                "0:a?",
+                "0:a:0?",  # First audio stream (optional)
                 "-c",
                 "copy",
-                "-copyts",
-                "-start_at_zero",
                 "-avoid_negative_ts",
-                "make_non_negative",
-                "-max_interleave_delta",
-                "0",
+                "make_zero",  # Fix timestamp issues
+                "-max_muxing_queue_size",
+                "2048",  # Increase muxing queue
                 "-f",
                 "mpegts",
                 "-muxdelay",
-                "0.5",  # Critical: allows muxer to fix timeline jumps
+                "0",  # Remove mux delay
+                "-muxpreload",
+                "0",
                 "-mpegts_flags",
-                "resend_headers+initial_discontinuity",
+                "resend_headers",
+                "-mpegts_copyts",
+                "1",
                 "-metadata",
                 f"service_name={name}",
+                "-flush_packets",
+                "1",  # Flush packets immediately
                 "pipe:1",
             ]
 
@@ -151,12 +202,12 @@ class StreamManager:
                 *cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                limit=1024 * 1024,  # 1MB internal buffer for the reader
+                limit=2 * 1024 * 1024,  # 2MB internal buffer for smoother streaming
             )
 
-            # Set Linux pipe size to 1MB (F_SETPIPE_SZ = 1031)
+            # Set Linux pipe size to 2MB for better buffering
             try:
-                fcntl.fcntl(proc.stdout.fileno(), 1031, 1048576)
+                fcntl.fcntl(proc.stdout.fileno(), 1031, 2 * 1048576)
             except:
                 pass
 
@@ -165,8 +216,10 @@ class StreamManager:
                 "created": time.time(),
                 "client_count": 1,
                 "last_client_disconnect": None,
+                "url": url_or_command,  # Store URL for logging
             }
             asyncio.create_task(self._drain_stderr(proc, unique_id))
+            logger.info(f"Created new stream {unique_id} for {name}")
             return unique_id
         except Exception as e:
             logger.error(f"Failed to create stream: {e}")
@@ -182,7 +235,7 @@ async def stream_handler(request):
     if not url:
         return web.Response(text="Missing URL", status=400)
 
-    stream_id = await manager.create_stream(url, name)
+    stream_id = await manager.get_or_create_stream(url, name)
     if not stream_id:
         return web.Response(text="Max streams reached", status=503)
 
@@ -201,28 +254,63 @@ async def stream_handler(request):
 
     try:
         bytes_sent = 0
+        last_log = time.time()
+        stall_count = 0
+
         while True:
             if proc.returncode is not None:
+                logger.warning(
+                    f"Stream {stream_id} process died (returncode: {proc.returncode})"
+                )
                 break
 
             try:
-                # Read whatever is available up to 256KB
-                chunk = await asyncio.wait_for(proc.stdout.read(262144), timeout=20.0)
+                # Read smaller chunks more frequently for smoother delivery
+                # 188 bytes * 350 = 65,800 bytes (350 MPEG-TS packets per chunk)
+                chunk = await asyncio.wait_for(proc.stdout.read(65800), timeout=5.0)
             except asyncio.TimeoutError:
-                break
+                stall_count += 1
+                if stall_count > 3:
+                    logger.error(
+                        f"Stream {stream_id} stalled (no data for {stall_count * 5}s)"
+                    )
+                    break
+                logger.warning(f"Read timeout on {stream_id} (stall {stall_count}/4)")
+                continue
 
             if not chunk:
+                logger.info(f"Stream {stream_id} ended (EOF)")
                 break
 
-            await response.write(chunk)
+            stall_count = 0  # Reset stall counter on successful read
+
+            try:
+                await response.write(chunk)
+            except Exception as write_err:
+                logger.warning(f"Write failed on {stream_id}: {write_err}")
+                break
+
             bytes_sent += len(chunk)
 
+            # Log progress every 30 seconds
+            now = time.time()
+            if now - last_log > 30:
+                logger.info(
+                    f"Stream {stream_id}: {bytes_sent / 1024 / 1024:.1f} MB sent, "
+                    f"clients: {info['client_count']}"
+                )
+                last_log = now
+
     except (asyncio.CancelledError, ConnectionResetError):
-        pass
+        logger.info(f"Client connection closed for {stream_id}")
     except Exception as e:
         logger.error(f"Handler error on {stream_id}: {e}")
     finally:
-        await manager._terminate_stream(stream_id)
+        # Don't terminate - just decrement client count
+        await manager.client_disconnected(stream_id)
+        logger.info(
+            f"Client session ended for {stream_id}, sent {bytes_sent / 1024 / 1024:.1f} MB"
+        )
 
     return response
 
