@@ -9,6 +9,7 @@ import hashlib
 import logging
 import subprocess
 import time
+import fcntl
 
 from aiohttp import web
 
@@ -164,9 +165,9 @@ class StreamManager:
             cmd = [
                 "ffmpeg",
                 "-loglevel", "warning",
-                "-probesize", "32",
-                "-analyzeduration", "0",
-                "-fflags", "+genpts+discardcorrupt+nobuffer",
+                "-probesize", "5M",
+                "-analyzeduration", "5M",
+                "-fflags", "+genpts+discardcorrupt+igndts+nobuffer",
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "1",
@@ -174,7 +175,10 @@ class StreamManager:
                 "-map", "0:v",
                 "-map", "0:a?",
                 "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
+                "-copyts",
+                "-start_at_zero",
+                "-avoid_negative_ts", "make_non_negative",
+                "-max_interleave_delta", "0",
                 "-f", "mpegts",
                 "-muxdelay", "0",
                 "-flush_packets", "1",
@@ -188,6 +192,12 @@ class StreamManager:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
+
+            # 1048576 is 1MB. F_SETPIPE_SZ is 1031 on Linux.
+            try:
+                fcntl.fcntl(proc.stdout.fileno(), 1031, 1048576)
+            except Exception as e:
+                logger.debug(f"Could not increase pipe size: {e}")
 
             self.streams[unique_id] = {
                 "process": proc,
@@ -282,7 +292,7 @@ async def stream_handler(request):
                         )
                         first_chunk = False
                 else:
-                    chunk = await proc.stdout.read(65536)
+                    chunk = await proc.stdout.readany()
             except asyncio.TimeoutError:
                 logger.error(
                     f"Stream {stream_id} timeout waiting for FFmpeg data"
