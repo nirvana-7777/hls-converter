@@ -1,12 +1,16 @@
-FROM python:3.11-alpine
+# Use Debian Slim for glibc performance and stability
+FROM python:3.11-slim-bookworm
 
-# 1. Install tini for signal handling and curl for healthchecks
-# 2. Ensure ffmpeg is present
-RUN apk add --no-cache ffmpeg curl tini
+# Install ffmpeg and tini
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Optimize Python environment
+# Enable Python optimizations
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONOPTIMIZE=1
@@ -18,8 +22,7 @@ COPY mpegts-proxy.py .
 
 EXPOSE 8000
 
-# Use tini to manage FFmpeg subprocesses correctly
+# tini is essential for reaping ffmpeg subprocesses
 ENTRYPOINT ["/sbin/tini", "--"]
 
-# Run with optimized Python execution
 CMD ["python", "mpegts-proxy.py"]
