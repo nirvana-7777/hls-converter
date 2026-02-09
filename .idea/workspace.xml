@@ -3,7 +3,6 @@
   <component name="ChangeListManager">
     <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="Initial">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Dockerfile" beforeDir="false" afterPath="$PROJECT_DIR$/Dockerfile" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/mpegts-proxy.py" beforeDir="false" afterPath="$PROJECT_DIR$/mpegts-proxy.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -268,7 +267,23 @@
       <option name="project" value="LOCAL" />
       <updated>1770630287876</updated>
     </task>
-    <option name="localTasksCounter" value="27" />
+    <task id="LOCAL-00027" summary="Initial">
+      <option name="closed" value="true" />
+      <created>1770630537267</created>
+      <option name="number" value="00027" />
+      <option name="presentableId" value="LOCAL-00027" />
+      <option name="project" value="LOCAL" />
+      <updated>1770630537267</updated>
+    </task>
+    <task id="LOCAL-00028" summary="Initial">
+      <option name="closed" value="true" />
+      <created>1770630672232</created>
+      <option name="number" value="00028" />
+      <option name="presentableId" value="LOCAL-00028" />
+      <option name="project" value="LOCAL" />
+      <updated>1770630672232</updated>
+    </task>
+    <option name="localTasksCounter" value="29" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

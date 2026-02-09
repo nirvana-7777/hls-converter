@@ -161,7 +161,7 @@ class StreamManager:
                 logger.error(f"Failed to parse FFmpeg command: {e}")
                 return None
         else:
-            # Regular URL -  build our own FFmpeg command
+            # Regular URL - build our own FFmpeg command
             cmd = [
                 "ffmpeg",
                 "-loglevel", "warning",
@@ -292,7 +292,7 @@ async def stream_handler(request):
                         )
                         first_chunk = False
                 else:
-                    chunk = await proc.stdout.readany()
+                    chunk = await proc.stdout.read(262144)
             except asyncio.TimeoutError:
                 logger.error(
                     f"Stream {stream_id} timeout waiting for FFmpeg data"
