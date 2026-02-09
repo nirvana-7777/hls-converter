@@ -155,35 +155,37 @@ class StreamManager:
             cmd = [
                 "ffmpeg",
                 "-loglevel",
-                "error",  # Only show errors, not warnings
+                "error",
                 "-fflags",
-                "+genpts+igndts",  # Generate PTS, ignore DTS issues
+                "+genpts+igndts+discardcorrupt",  # Added discardcorrupt for resilience
                 "-probesize",
-                "32M",  # Increased for better format detection
+                "5M",  # Reduced from 32M for faster startup
                 "-analyzeduration",
-                "10M",
+                "2M",  # Reduced from 10M for faster startup
                 "-reconnect",
                 "1",
                 "-reconnect_streamed",
                 "1",
                 "-reconnect_delay_max",
                 "2",
+                "-thread_queue_size",
+                "512",  # Increase thread queue to prevent drops during startup
                 "-i",
                 url_or_command,
                 "-map",
-                "0:v:0",  # First video stream
+                "0:v:0",
                 "-map",
-                "0:a:0?",  # First audio stream (optional)
+                "0:a:0?",
                 "-c",
                 "copy",
                 "-avoid_negative_ts",
-                "make_zero",  # Fix timestamp issues
+                "make_zero",
                 "-max_muxing_queue_size",
-                "2048",  # Increase muxing queue
+                "4096",  # Doubled for startup buffering
                 "-f",
                 "mpegts",
                 "-muxdelay",
-                "0",  # Remove mux delay
+                "0",
                 "-muxpreload",
                 "0",
                 "-mpegts_flags",
@@ -193,7 +195,7 @@ class StreamManager:
                 "-metadata",
                 f"service_name={name}",
                 "-flush_packets",
-                "1",  # Flush packets immediately
+                "1",
                 "pipe:1",
             ]
 
@@ -256,6 +258,7 @@ async def stream_handler(request):
         bytes_sent = 0
         last_log = time.time()
         stall_count = 0
+        chunk_count = 0
 
         while True:
             if proc.returncode is not None:
@@ -264,18 +267,30 @@ async def stream_handler(request):
                 )
                 break
 
+            # Adaptive timeout: longer during startup (first 10 chunks), shorter after
+            timeout = 10.0 if chunk_count < 10 else 5.0
+
             try:
                 # Read smaller chunks more frequently for smoother delivery
                 # 188 bytes * 350 = 65,800 bytes (350 MPEG-TS packets per chunk)
-                chunk = await asyncio.wait_for(proc.stdout.read(65800), timeout=5.0)
+                chunk = await asyncio.wait_for(proc.stdout.read(65800), timeout=timeout)
             except asyncio.TimeoutError:
                 stall_count += 1
-                if stall_count > 3:
+                # More lenient during startup
+                max_stalls = 5 if chunk_count < 10 else 3
+                if stall_count > max_stalls:
                     logger.error(
-                        f"Stream {stream_id} stalled (no data for {stall_count * 5}s)"
+                        f"Stream {stream_id} stalled (no data for {stall_count * timeout:.0f}s)"
                     )
                     break
-                logger.warning(f"Read timeout on {stream_id} (stall {stall_count}/4)")
+                if chunk_count < 10:
+                    logger.debug(
+                        f"Startup buffering on {stream_id} (stall {stall_count}/{max_stalls})"
+                    )
+                else:
+                    logger.warning(
+                        f"Read timeout on {stream_id} (stall {stall_count}/{max_stalls})"
+                    )
                 continue
 
             if not chunk:
@@ -283,6 +298,7 @@ async def stream_handler(request):
                 break
 
             stall_count = 0  # Reset stall counter on successful read
+            chunk_count += 1
 
             try:
                 await response.write(chunk)
@@ -291,6 +307,12 @@ async def stream_handler(request):
                 break
 
             bytes_sent += len(chunk)
+
+            # Log first successful chunk after startup
+            if chunk_count == 1:
+                logger.info(
+                    f"Stream {stream_id} started successfully, first chunk delivered"
+                )
 
             # Log progress every 30 seconds
             now = time.time()
