@@ -1,19 +1,34 @@
 # MPEG-TS Stream Proxy
 
-Convert DASH (MPD) streams to MPEG-TS format on-the-fly for direct streaming.
+Convert DASH (MPD), HLS (m3u8), RTSP and other FFmpeg-supported sources to MPEG-TS format on-the-fly for direct streaming. Stream copy only — no re-encoding, no disk storage.
 
 [![Docker Build](https://github.com/YOUR_USERNAME/YOUR_REPO/actions/workflows/docker-build.yml/badge.svg)](https://github.com/YOUR_USERNAME/YOUR_REPO/actions/workflows/docker-build.yml)
 [![Docker Pulls](https://img.shields.io/docker/pulls/nirvana777/hls-converter)](https://hub.docker.com/r/nirvana777/hls-converter)
 
 ## Features
 
-- 🎥 Real-time DASH to MPEG-TS conversion
-- 🚀 FFmpeg-based streaming (copy mode - no re-encoding)
-- 🧹 Automatic cleanup of dead/stale streams
-- 📊 Health monitoring with stream statistics
-- 🔒 Resource limits (max streams, max age)
-- 🔄 Smart stream reuse (same URL shares FFmpeg process)
+- 🎥 Real-time DASH / HLS / RTSP → MPEG-TS conversion (copy mode — no re-encoding)
+- 🚀 FFmpeg-based streaming with pre-flight first-byte check
+- 🔄 Smart stream reuse (same URL shares one FFmpeg process, fanned out to all viewers)
+- 🧹 Automatic cleanup of dead/stale streams (streams with active viewers are never evicted)
+- 📊 Health monitoring with stream statistics (`/health`) + Prometheus metrics (`/metrics`)
+- 🔒 Bearer-token authentication on `/stream`
+- 🛡️ SSRF defense-in-depth: scheme allow-list, private/link-local/metadata IP rejection, credential redaction in logs and error bodies
+- 🐢 Slow-client management: bounded per-client buffers (~2 MB) with drop-oldest (live-edge) policy
+- ⚙️ Full configuration via environment variables — no code edits needed
 - 🐳 Docker ready (Alpine-based, small footprint)
+
+## Security Model
+
+Read this before exposing the service beyond a trusted LAN:
+
+- **Auth**: every `/stream` request requires a bearer token (`Authorization: Bearer <token>`, set via `MPEGTS_AUTH_TOKEN`). `/health` and `/metrics` are unauthenticated by design (for orchestration and Prometheus scraping). Without a configured token the service refuses all `/stream` requests with `503` rather than running open — set `MPEGTS_AUTH_DISABLED=1` only for LAN development.
+- **`pipe://` is disabled by default.** When enabled (`MPEGTS_ALLOW_PIPE=1`) it executes arbitrary commands — treat it as a remote-code-execution surface. It stays behind auth either way.
+- **SSRF checks (http/https only)**: private, loopback, link-local, reserved, multicast and cloud-metadata IPs are rejected. `rtsp/rtp/udp/rtmp/mms` may target LAN hosts legitimately (cameras, encoders) and are exempt. `MPEGTS_ALLOW_PRIVATE_URLS=1` disables the check for all schemes (adds http/https SSRF risk).
+- **URL validation is defense-in-depth, NOT a security boundary**: FFmpeg re-resolves DNS on its own and follows HTTP redirects, so DNS-rebinding and redirect-based SSRF cannot be fully prevented at the application layer. Internet-facing deployments MUST also enforce egress filtering at the network layer (block RFC1918, 169.254.0.0/16 and cloud metadata endpoints at the firewall/NAT).
+- **URLs are never rewritten** (no DNS pinning): pinning breaks HTTPS (SNI/certificate mismatch) and vhosted HTTP, and breaks stream dedup on round-robin DNS. Streams are keyed by the original URL; the short ID in logs/health is display-only.
+- **Credentials never leak**: tokens/api-keys/passwords in query strings and `user:pass@host` userinfo are redacted from logs, `/health` and 502 bodies; `/health` shows sanitized URLs (no query, no credentials); `pipe://` commands are never displayed.
+- **FFmpeg hardening**: `-nostdin`, protocol whitelist without `file` (a remote playlist cannot pull local files), each process runs in its own process group for clean teardown on shutdown.
 
 ## Quick Start
 
@@ -25,20 +40,25 @@ docker pull nirvana777/hls-converter:latest
 docker run -d \
   --name mpegts-proxy \
   -p 8000:8000 \
+  -e MPEGTS_AUTH_TOKEN="change-me" \
   nirvana777/hls-converter:latest
 ```
+
+> Without `MPEGTS_AUTH_TOKEN` (or `MPEGTS_AUTH_DISABLED=1` for LAN-only dev), every `/stream` request is refused with `503` by design.
 
 ### Using Docker Compose
 
 ```yaml
-version: '3.8'
-
 services:
   mpegts-proxy:
     image: nirvana777/hls-converter:latest
     container_name: mpegts-proxy
     ports:
       - "8000:8000"
+    environment:
+      MPEGTS_AUTH_TOKEN: "change-me"
+      # MPEGTS_MAX_STREAMS: "15"
+      # MPEGTS_MAX_STREAM_AGE: "3600"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
@@ -56,6 +76,8 @@ services:
           memory: 512M
 ```
 
+`/health` is unauthenticated, so the healthcheck works with auth enabled.
+
 ### Local Development
 
 ```bash
@@ -63,35 +85,56 @@ services:
 git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
 cd YOUR_REPO
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (Python >= 3.10, aiohttp)
+pip install -r requirements.txt   # or: pip install aiohttp
 
 # Install FFmpeg (Ubuntu/Debian)
 sudo apt-get install ffmpeg
 
-# Run service
-python mpegts-proxy.py
+# Run service (set a token, or disable auth for LAN dev)
+MPEGTS_AUTH_TOKEN="dev-token" python mpegts_proxy.py
 ```
 
 ## API Usage
 
-### Stream a DASH URL
+### Stream a source
 
 ```bash
-# Direct streaming (outputs MPEG-TS)
-curl "http://localhost:8000/stream?url=https://example.com/stream.mpd&name=MyStream" > output.ts
+# Direct streaming with auth (outputs MPEG-TS)
+curl -H "Authorization: Bearer dev-token" \
+  "http://localhost:8000/stream?url=https://example.com/stream.mpd&name=MyStream" \
+  -o output.ts
 
-# Use in media player (VLC, ffplay, etc.)
+# Use in a media player
+ffplay -headers $'Authorization: Bearer dev-token\r\n' \
+  "http://localhost:8000/stream?url=https://example.com/stream.mpd"
+
+# With auth disabled (MPEGTS_AUTH_DISABLED=1, trusted LAN only)
 vlc "http://localhost:8000/stream?url=https://example.com/stream.mpd"
-ffplay "http://localhost:8000/stream?url=https://example.com/stream.mpd"
 ```
+
+Supported `url` schemes: `http`, `https` (DASH `.mpd`, HLS `.m3u8`, direct TS/FLV...), `rtsp`, `rtmp`, `udp`, `rtp`, `mms` — anything FFmpeg can demux. `pipe://` only when explicitly enabled.
 
 ### Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `url` | Yes | DASH manifest URL (.mpd) |
-| `name` | No | Stream name for metadata (default: "Stream") |
+| `url`     | Yes | Source URL (DASH manifest, HLS playlist, RTSP camera, ...) |
+| `name`    | No  | Stream name written as MPEG-TS `service_name` metadata (default: `"Stream"`, max 64 chars). Does **not** affect stream sharing — reuse is keyed by `url` only. |
+
+### Response Codes
+
+| Code | Meaning |
+|------|---------|
+| `200` | Success — `video/mp2t` byte stream |
+| `400` | Missing `url`, or URL failed validation (scheme not allowed, private IP rejected, `pipe://` disabled, DNS failure) — reason in JSON body |
+| `401` | Missing bearer token (`WWW-Authenticate: Bearer` header included) |
+| `403` | Invalid bearer token |
+| `502` | FFmpeg not found / spawn failed, or source exited before producing output — body carries the redacted FFmpeg stderr tail for diagnosis |
+| `503` | Auth token not configured; max streams reached; per-stream client cap; stream terminated during subscribe |
+| `504` | Spawn did not complete within `MPEGTS_SPAWN_WAIT_TIMEOUT` |
+
+Slow or dead sources fail **before headers are committed**: the first subscriber waits up to `MPEGTS_PREFLIGHT_TIMEOUT` (default 5 s) for the first byte, so a dead URL yields a real `502` with diagnostics instead of a `200` with an empty body.
 
 ### Health Check
 
@@ -99,37 +142,84 @@ ffplay "http://localhost:8000/stream?url=https://example.com/stream.mpd"
 curl http://localhost:8000/health
 ```
 
-Response:
+Response (URLs sanitized, stderr redacted):
+
 ```json
 {
   "status": "healthy",
-  "streams": 2,
-  "max_streams": 10,
+  "streams": 1,
+  "alive_streams": 1,
+  "max_streams": 15,
+  "totals": {
+    "bytes_read": 123456789,
+    "stalls": 2,
+    "streams_created": 42
+  },
   "stream_details": [
     {
-      "id": "a1b2c3d4",
+      "id": "a1b2c3d4e5f6",
+      "name": "MyStream",
+      "url": "https://example.com/stream.mpd",
       "age": 120,
       "clients": 2,
-      "alive": true
+      "alive": true,
+      "bytes_read": 9876543,
+      "stall_events": 0,
+      "last_stderr": []
     }
   ]
 }
 ```
 
-## Configuration
+### Prometheus Metrics
 
-Configuration is done via code constants in `mpegts-proxy.py`:
-
-```python
-manager = StreamManager(
-    max_streams=10,      # Maximum concurrent streams
-    max_stream_age=3600  # Maximum stream lifetime (1 hour)
-)
+```bash
+curl http://localhost:8000/metrics
 ```
 
-Cleanup intervals (in `StreamManager._cleanup_loop`):
-- **Cleanup frequency**: 30 seconds
-- **Idle timeout**: 300 seconds (5 minutes)
+Open (unauthenticated) endpoint in Prometheus text exposition format:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `mpegts_proxy_active_streams` | gauge | Tracked streams |
+| `mpegts_proxy_alive_streams` | gauge | Streams whose source process is alive |
+| `mpegts_proxy_active_clients` | gauge | Connected clients across all streams |
+| `mpegts_proxy_max_streams` | gauge | Configured stream cap |
+| `mpegts_proxy_bytes_read_total` | counter | Cumulative bytes read from sources (pre fan-out) |
+| `mpegts_proxy_stream_stalls_total` | counter | Cumulative per-client read stalls |
+| `mpegts_proxy_streams_created_total` | counter | Streams ever created |
+
+```yaml
+# prometheus.yml scrape config
+scrape_configs:
+  - job_name: mpegts-proxy
+    static_configs:
+      - targets: ["your-host:8000"]
+```
+
+## Configuration
+
+All configuration is via environment variables — no code edits required:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MPEGTS_AUTH_TOKEN` | *(unset)* | Bearer token required on `/stream`. Unset + auth enabled = all requests refused |
+| `MPEGTS_AUTH_DISABLED` | `false` | Disable authentication (trusted LAN development only) |
+| `MPEGTS_ALLOW_PIPE` | `false` | Enable `pipe://` sources (executes arbitrary commands — RCE surface) |
+| `MPEGTS_ALLOW_PRIVATE_URLS` | `false` | Allow private/LAN IPs for http/https too (SSRF risk) |
+| `MPEGTS_HOST` | `0.0.0.0` | HTTP listen address |
+| `MPEGTS_PORT` | `8000` | HTTP listen port |
+| `MPEGTS_MAX_STREAMS` | `15` | Maximum concurrent source streams |
+| `MPEGTS_MAX_STREAM_AGE` | `3600` | Max stream age in seconds (only evicts streams with no viewers) |
+| `MPEGTS_IDLE_TIMEOUT` | `300` | Seconds with zero viewers before eviction |
+| `MPEGTS_CLEANUP_INTERVAL` | `30` | Cleanup loop period in seconds |
+| `MPEGTS_MAX_CLIENTS_PER_STREAM` | `50` | Per-stream client cap (503 beyond) |
+| `MPEGTS_CLIENT_QUEUE_MAXSIZE` | `32` | Per-client chunk buffer (32 × ~64 KB ≈ 2 MB; drop-oldest when full) |
+| `MPEGTS_READ_SIZE` | `65800` | Bytes per chunk read from FFmpeg (350 × 188-byte TS packets) |
+| `MPEGTS_SPAWN_WAIT_TIMEOUT` | `30` | Seconds a concurrent request waits for an in-flight spawn (504 beyond) |
+| `MPEGTS_PREFLIGHT_TIMEOUT` | `5` | Seconds the first subscriber waits for the first byte before headers |
+| `MPEGTS_USER_AGENT` | *(unset)* | Custom User-Agent passed to FFmpeg (`-user_agent`) |
+| `MPEGTS_LOG_LEVEL` | `INFO` | Logging level |
 
 ## Architecture
 
@@ -148,38 +238,42 @@ Cleanup intervals (in `StreamManager._cleanup_loop`):
                                                     │
                                                     ▼
                                             ┌───────────────┐
-                                            │  DASH Source  │
-                                            │  (.mpd URL)   │
+                                            │  DASH / HLS /  │
+                                            │  RTSP Source   │
                                             └───────────────┘
-
-Key Features:
-• Stream Reuse: Same URL = same FFmpeg process (multiple clients)
-• Auto Cleanup: Dead/idle/old streams removed every 30s
-• Process Monitoring: Health checks on FFmpeg processes
-• Resource Limits: Max 10 concurrent streams (configurable)
 ```
+
+Key properties:
+
+- **Stream reuse**: same URL = one FFmpeg process; each client gets its own bounded queue fed by a single reader (fan-out).
+- **Spawn dedup**: concurrent requests for the same URL wait on one in-flight spawn instead of starting duplicates.
+- **Pre-flight check**: dead sources fail fast with a real 502 + stderr before any headers are sent.
+- **Slow clients**: bounded queue with drop-oldest — a client that falls behind skips ahead to the live edge instead of stalling the source or being starved; repeated read stalls disconnect the client.
+- **Auto cleanup**: dead processes, idle and over-age streams removed every `MPEGTS_CLEANUP_INTERVAL`; dead entries are also pruned on demand at request time so the cap never lags.
+- **Process monitoring**: health/metrics expose process liveness, bytes read and stall counters.
+- **Resource limits**: max 15 concurrent streams by default (`MPEGTS_MAX_STREAMS`), 50 clients per stream.
+- **Graceful shutdown**: SIGTERM → SIGKILL to the whole FFmpeg process group — no orphaned processes.
 
 ## How It Works
 
-1. **Client requests stream** → `/stream?url=<mpd_url>`
-2. **Proxy checks** if stream already exists for this URL
-3. **If exists**: Reuses existing FFmpeg process (increments client count)
-4. **If new**: Creates FFmpeg process with MPEG-TS output to stdout
-5. **Streams data** → Reads from FFmpeg stdout, writes to HTTP response
-6. **Background cleanup** → Every 30s, removes:
-   - Dead FFmpeg processes
-   - Streams older than 1 hour
-   - Streams idle for 5+ minutes (no clients)
-7. **Client disconnect** → Decrements client count
-8. **No clients** → Stream marked for cleanup after 5 min idle
+1. **Auth middleware** validates the bearer token (`/health` and `/metrics` are exempt).
+2. **URL validation**: scheme allow-list + IP checks; rejected URLs return `400` with the reason.
+3. **Get-or-create**: an alive stream for the exact URL is reused; a dead entry is pruned immediately; otherwise one FFmpeg process spawns (concurrent requests for the same URL wait on it, up to `MPEGTS_SPAWN_WAIT_TIMEOUT`).
+4. **Pre-flight** (first subscriber only): wait up to `MPEGTS_PREFLIGHT_TIMEOUT` for the first byte — a source that dies first returns `502` with its redacted stderr tail.
+5. **Subscribe**: the handler registers its own bounded queue and the response begins (`video/mp2t`, no proxy buffering via `X-Accel-Buffering: no`).
+6. **Fan-out loop**: chunks read from FFmpeg stdout are written to every subscriber; a full client queue drops its oldest chunk (live-edge policy).
+7. **Client disconnect / stall**: subscriber removed; repeated read stalls (10 s timeouts for the first 10 chunks, then 5 s; 5 then 3 consecutive) disconnect the client.
+8. **EOF or termination**: every subscriber is woken with a sentinel and closes cleanly.
+9. **Background cleanup** every `MPEGTS_CLEANUP_INTERVAL`: dead processes reaped; streams idle past `MPEGTS_IDLE_TIMEOUT` or older than `MPEGTS_MAX_STREAM_AGE` with no viewers removed. **Streams with active viewers are never evicted.**
+10. **Shutdown**: cleanup task stopped, every stream's process group killed (SIGTERM → SIGKILL), pumps and handlers closed cleanly.
 
 ## Performance Tips
 
-1. **Memory**: Each stream uses ~50-100MB. Monitor with `/health`
-2. **Concurrent streams**: Default 10, adjust `max_streams` for your hardware
-3. **Stream reuse**: Multiple clients can watch the same URL efficiently
-4. **CPU**: FFmpeg uses copy mode (no transcoding), minimal CPU usage
-5. **Network**: Outbound bandwidth = (stream bitrate × active clients)
+1. **Memory**: each FFmpeg process uses ~50–100 MB; add ~2 MB per connected client (bounded queue). Monitor with `/health`.
+2. **Concurrent streams**: default 15 — adjust `MPEGTS_MAX_STREAMS` for your hardware.
+3. **Stream reuse**: N viewers of one URL cost one source fetch — inbound bandwidth is (bitrate × unique streams), outbound is (bitrate × clients).
+4. **CPU**: copy mode means no transcoding; near-zero proxy CPU — the work is I/O.
+5. **Bursty sources**: if clients stutter, raise `MPEGTS_CLIENT_QUEUE_MAXSIZE` before touching anything else.
 
 ## Monitoring
 
@@ -188,45 +282,52 @@ Key Features:
 curl http://localhost:8000/health | jq
 ```
 
+### Scrape metrics
+```bash
+curl http://localhost:8000/metrics | head
+```
+
 ### Watch FFmpeg logs
 ```bash
-# Container logs show stream lifecycle
+# Container logs show stream lifecycle + redacted FFmpeg errors
 docker logs -f mpegts-proxy
 ```
 
 ### Resource usage
 ```bash
-# Inside container
 docker exec mpegts-proxy ps aux
 docker stats mpegts-proxy
 ```
 
 ## Troubleshooting
 
-### Stream won't start
-- **Check URL**: Verify DASH manifest is accessible
+### Stream won't start (502)
+- **Read the response body** — it contains FFmpeg's stderr (credentials redacted) for sources that died before producing output
+- **Check URL**: verify the manifest is reachable *from the container* (geo-blocks and expired signed URLs are common)
 - **Check logs**: `docker logs mpegts-proxy` for FFmpeg errors
-- **Network**: Ensure container can reach external URLs
 
-### "Max streams reached" (503 error)
-- Increase `max_streams` in code
-- Check `/health` to see if streams are stuck
-- Wait for cleanup (runs every 30s)
+### 401 / 403 / 503 "refusing all requests"
+- Send `Authorization: Bearer <token>`; the token comes from `MPEGTS_AUTH_TOKEN`
+- `503 ... not configured` means auth is enabled but no token is set
+
+### URL rejected with 400
+- `scheme ... not allowed`: only `http/https/rtsp/rtp/udp/rtmp/mms` are accepted (`file://`, `ftp://` are not)
+- `ip ... is disallowed`: private/loopback/metadata IP over http/https — use the `rtsp://`/`udp://` form for LAN cameras, or `MPEGTS_ALLOW_PRIVATE_URLS=1` (SSRF risk)
+- `pipe:// is disabled`: set `MPEGTS_ALLOW_PIPE=1` — understand it executes commands
+- `DNS resolution failed`: hostname doesn't resolve from the container
+
+### "Max streams reached" (503)
+- Raise `MPEGTS_MAX_STREAMS` (env var — no code edit)
+- Check `/health` for stuck streams; dead ones are pruned on demand at the next request, everything else within one cleanup interval (30 s default)
 
 ### Stream stops unexpectedly
-- FFmpeg process may have crashed (check logs)
-- Source stream may have ended
-- Stream exceeded max age (1 hour default)
+- FFmpeg crashed or the source ended — `last_stderr` in `/health` shows the final lines
+- Idle eviction: with zero viewers the stream is removed after `MPEGTS_IDLE_TIMEOUT` (5 min default) — active viewers are never evicted
+- Max age: 1 h default (`MPEGTS_MAX_STREAM_AGE`), also only with no viewers
 
 ### High memory usage
-- Reduce `max_streams`
-- Check for stuck streams in `/health`
-- Restart container to clear all streams
-
-### No cleanup happening
-- Background cleanup task runs every 30s automatically
-- Check logs for "Started stream cleanup task"
-- Verify app is running (not just FFmpeg processes)
+- Reduce `MPEGTS_MAX_STREAMS`; each stream is an FFmpeg process (~50–100 MB) plus ~2 MB per client
+- Check for stuck streams in `/health`; restart the container as a last resort
 
 ## Differences from HLS Converter
 
@@ -245,8 +346,9 @@ This is **not** an HLS converter. Key differences:
 
 ✅ **Good for:**
 - Direct streaming to media players (VLC, ffplay)
-- Low-latency proxy for DASH sources
-- Simple DASH → MPEG-TS conversion
+- Low-latency proxy for DASH/HLS sources
+- Repackaging LAN RTSP cameras/encoders as MPEG-TS over HTTP
+- Simple source → MPEG-TS conversion
 - Temporary stream access (no recording)
 
 ❌ **Not for:**
@@ -274,15 +376,20 @@ Set in GitHub repository settings:
 
 ## Roadmap
 
+Done:
+
+- [x] Authentication/API keys — bearer-token auth (`MPEGTS_AUTH_TOKEN`)
+- [x] Configuration via environment variables — full `MPEGTS_*` env config
+- [x] Prometheus metrics endpoint — `GET /metrics`
+- [x] Input URL validation (prevent SSRF) — scheme + IP checks (defense-in-depth; pair with network-layer egress filtering)
+- [x] Configurable timeout on FFmpeg startup — `MPEGTS_SPAWN_WAIT_TIMEOUT`, `MPEGTS_PREFLIGHT_TIMEOUT`
+
 Potential improvements:
 
-- [ ] Authentication/API keys
 - [ ] Rate limiting per IP
-- [ ] Configuration via environment variables
-- [ ] Prometheus metrics endpoint
 - [ ] Stream quality/bitrate selection
-- [ ] Input URL validation (prevent SSRF)
-- [ ] Configurable timeout on FFmpeg startup
+- [ ] Per-client API keys / token rotation
+- [ ] OpenMetrics exposition (`application/openmetrics-text`)
 
 ## License
 
@@ -293,7 +400,7 @@ MIT
 Pull requests welcome! Ensure:
 - Code follows existing async patterns
 - Add logging for new features
-- Test with actual DASH streams
+- Test with actual DASH streams (run the smoke tests: `python3 scripts/smoke_test.py`, requires `ffmpeg`)
 - Docker build succeeds
 
 ## Support
