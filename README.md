@@ -14,7 +14,7 @@ Convert DASH (MPD), HLS (m3u8), RTSP and other FFmpeg-supported sources to MPEG-
 - 📊 Health monitoring with stream statistics (`/health`) + Prometheus metrics (`/metrics`)
 - 🔒 Bearer-token authentication on `/stream`
 - 🛡️ SSRF defense-in-depth: scheme allow-list, private/link-local/metadata IP rejection, credential redaction in logs and error bodies
-- 🐢 Slow-client management: bounded per-client buffers (~2 MB) with drop-oldest (live-edge) policy
+- 🐢 Slow-client management: bounded per-client buffers (~4 MB); a lagging client is skipped ahead to the live edge in one packet-aligned batch that resumes on a PES frame start — every skip is counted and logged
 - ⚙️ Full configuration via environment variables — no code edits needed
 - 🐳 Docker ready (Alpine-based, small footprint)
 
@@ -152,6 +152,8 @@ Response (URLs sanitized, stderr redacted):
   "max_streams": 15,
   "totals": {
     "bytes_read": 123456789,
+    "dropped_chunks": 0,
+    "dropped_bytes": 0,
     "stalls": 2,
     "streams_created": 42
   },
@@ -164,6 +166,8 @@ Response (URLs sanitized, stderr redacted):
       "clients": 2,
       "alive": true,
       "bytes_read": 9876543,
+      "dropped_chunks": 0,
+      "dropped_bytes": 0,
       "stall_events": 0,
       "last_stderr": []
     }
@@ -188,6 +192,8 @@ Open (unauthenticated) endpoint in Prometheus text exposition format:
 | `mpegts_proxy_bytes_read_total` | counter | Cumulative bytes read from sources (pre fan-out) |
 | `mpegts_proxy_stream_stalls_total` | counter | Cumulative per-client read stalls |
 | `mpegts_proxy_streams_created_total` | counter | Streams ever created |
+| `mpegts_proxy_dropped_chunks_total` | counter | Chunks skipped by live-edge evictions (clients that fell behind) |
+| `mpegts_proxy_dropped_bytes_total` | counter | Bytes skipped by live-edge evictions (always whole 188-byte packets, re-anchored on PES starts) |
 
 ```yaml
 # prometheus.yml scrape config
@@ -214,11 +220,13 @@ All configuration is via environment variables — no code edits required:
 | `MPEGTS_IDLE_TIMEOUT` | `300` | Seconds with zero viewers before eviction |
 | `MPEGTS_CLEANUP_INTERVAL` | `30` | Cleanup loop period in seconds |
 | `MPEGTS_MAX_CLIENTS_PER_STREAM` | `50` | Per-stream client cap (503 beyond) |
-| `MPEGTS_CLIENT_QUEUE_MAXSIZE` | `32` | Per-client chunk buffer (32 × ~64 KB ≈ 2 MB; drop-oldest when full) |
+| `MPEGTS_CLIENT_QUEUE_MAXSIZE` | `64` | Per-client chunk buffer (64 × ~64 KB ≈ 4 MB; should comfortably exceed one DASH segment burst). Overflow skips the client ahead to the live edge in ONE batch, re-anchored on a PES start; skips are counted in `/health` |
 | `MPEGTS_READ_SIZE` | `65800` | Bytes per chunk read from FFmpeg (350 × 188-byte TS packets) |
 | `MPEGTS_SPAWN_WAIT_TIMEOUT` | `30` | Seconds a concurrent request waits for an in-flight spawn (504 beyond) |
 | `MPEGTS_PREFLIGHT_TIMEOUT` | `5` | Seconds the first subscriber waits for the first byte before headers |
 | `MPEGTS_USER_AGENT` | *(unset)* | Custom User-Agent passed to FFmpeg (`-user_agent`) |
+| `MPEGTS_FFMPEG_EXTRA_IN` | *(unset)* | Extra FFmpeg args injected before `-i` (shlex-split) — e.g. `-headers` for token-gated origins |
+| `MPEGTS_FFMPEG_EXTRA_OUT` | *(unset)* | Extra FFmpeg args injected before the output (shlex-split) — e.g. `-mpegts_flags latm` for HE-AAC sources, `-an` to drop audio |
 | `MPEGTS_LOG_LEVEL` | `INFO` | Logging level |
 
 ## Architecture
@@ -245,10 +253,11 @@ All configuration is via environment variables — no code edits required:
 
 Key properties:
 
-- **Stream reuse**: same URL = one FFmpeg process; each client gets its own bounded queue fed by a single reader (fan-out).
+- **Stream reuse**: same URL = one FFmpeg process; each client gets its own bounded buffer fed by a single reader (fan-out).
 - **Spawn dedup**: concurrent requests for the same URL wait on one in-flight spawn instead of starting duplicates.
 - **Pre-flight check**: dead sources fail fast with a real 502 + stderr before any headers are sent.
-- **Slow clients**: bounded queue with drop-oldest — a client that falls behind skips ahead to the live edge instead of stalling the source or being starved; repeated read stalls disconnect the client.
+- **Packet-grid fan-out**: reads from FFmpeg are re-anchored on the 188-byte TS packet grid, so every chunk a client can ever receive is a whole number of packets — client demuxers never have to resync the byte stream.
+- **Slow clients**: bounded buffer with a batched live-edge policy — a client that falls behind is skipped ahead to the newest PES frame start in ONE batch (never spliced mid-packet); skips are counted (`dropped_chunks` / `dropped_bytes`), and repeated read stalls disconnect the client.
 - **Auto cleanup**: dead processes, idle and over-age streams removed every `MPEGTS_CLEANUP_INTERVAL`; dead entries are also pruned on demand at request time so the cap never lags.
 - **Process monitoring**: health/metrics expose process liveness, bytes read and stall counters.
 - **Resource limits**: max 15 concurrent streams by default (`MPEGTS_MAX_STREAMS`), 50 clients per stream.
@@ -260,8 +269,8 @@ Key properties:
 2. **URL validation**: scheme allow-list + IP checks; rejected URLs return `400` with the reason.
 3. **Get-or-create**: an alive stream for the exact URL is reused; a dead entry is pruned immediately; otherwise one FFmpeg process spawns (concurrent requests for the same URL wait on it, up to `MPEGTS_SPAWN_WAIT_TIMEOUT`).
 4. **Pre-flight** (first subscriber only): wait up to `MPEGTS_PREFLIGHT_TIMEOUT` for the first byte — a source that dies first returns `502` with its redacted stderr tail.
-5. **Subscribe**: the handler registers its own bounded queue and the response begins (`video/mp2t`, no proxy buffering via `X-Accel-Buffering: no`).
-6. **Fan-out loop**: chunks read from FFmpeg stdout are written to every subscriber; a full client queue drops its oldest chunk (live-edge policy).
+5. **Subscribe**: the handler registers its own bounded buffer (a late joiner starts at the next PES frame start, never mid-PES) and the response begins (`video/mp2t`, no proxy buffering via `X-Accel-Buffering: no`).
+6. **Fan-out loop**: chunks read from FFmpeg stdout are re-anchored on the 188-byte TS packet grid and written to every subscriber. A client that falls behind has its buffer trimmed to half in one batch, re-anchored on the next PES start, and the skip is counted (`dropped_chunks` / `dropped_bytes`) — visible in `/health`, `/metrics` and the logs.
 7. **Client disconnect / stall**: subscriber removed; repeated read stalls (10 s timeouts for the first 10 chunks, then 5 s; 5 then 3 consecutive) disconnect the client.
 8. **EOF or termination**: every subscriber is woken with a sentinel and closes cleanly.
 9. **Background cleanup** every `MPEGTS_CLEANUP_INTERVAL`: dead processes reaped; streams idle past `MPEGTS_IDLE_TIMEOUT` or older than `MPEGTS_MAX_STREAM_AGE` with no viewers removed. **Streams with active viewers are never evicted.**
@@ -269,11 +278,11 @@ Key properties:
 
 ## Performance Tips
 
-1. **Memory**: each FFmpeg process uses ~50–100 MB; add ~2 MB per connected client (bounded queue). Monitor with `/health`.
+1. **Memory**: each FFmpeg process uses ~50–100 MB; add up to ~4 MB per connected client (bounded queue, allocated only when a client lags). Monitor with `/health`.
 2. **Concurrent streams**: default 15 — adjust `MPEGTS_MAX_STREAMS` for your hardware.
 3. **Stream reuse**: N viewers of one URL cost one source fetch — inbound bandwidth is (bitrate × unique streams), outbound is (bitrate × clients).
 4. **CPU**: copy mode means no transcoding; near-zero proxy CPU — the work is I/O.
-5. **Bursty sources**: if clients stutter, raise `MPEGTS_CLIENT_QUEUE_MAXSIZE` before touching anything else.
+5. **Bursty sources**: if clients stutter or `dropped_chunks` in `/health` grows, raise `MPEGTS_CLIENT_QUEUE_MAXSIZE` before touching anything else.
 
 ## Monitoring
 
@@ -281,6 +290,8 @@ Key properties:
 ```bash
 curl http://localhost:8000/health | jq
 ```
+
+Drop watch: `curl -s http://localhost:8000/health | jq '.stream_details[] | {id, clients, bytes_read, dropped_chunks, dropped_bytes}'` — growing counters mean clients are falling behind (see Troubleshooting).
 
 ### Scrape metrics
 ```bash
@@ -305,6 +316,18 @@ docker stats mpegts-proxy
 - **Read the response body** — it contains FFmpeg's stderr (credentials redacted) for sources that died before producing output
 - **Check URL**: verify the manifest is reachable *from the container* (geo-blocks and expired signed URLs are common)
 - **Check logs**: `docker logs mpegts-proxy` for FFmpeg errors
+
+### Corrupted playback / decode errors on the client
+
+Symptoms: the player logs floods of `aac: channel element ... is not allocated`, `Prediction is not allowed in AAC-LC`, `h264: error while decoding MB`, `mpegts: PES packet size mismatch`, `Packet corrupt`, or `Invalid video timestamp: X -> Y` jumps.
+
+The proxy counts every live-edge skip (`dropped_chunks` / `dropped_bytes` per stream in `/health`, `mpegts_proxy_dropped_chunks_total` / `mpegts_proxy_dropped_bytes_total` in `/metrics`, plus a rate-limited `skipping a lagging client ahead to the live edge` warning in the logs). Use it to triage:
+
+1. **`dropped_chunks` grows while errors occur** → the client fell behind and was skipped ahead to the live edge. Each skip is packet-aligned and resumes on a PES frame start, so the player sees a clean jump: a brief continuity-counter notice (`mpegts: Packet corrupt` once or twice per jump — unavoidable in raw TS) and an `Invalid video timestamp: X -> Y` jump, then normal playback. If it happens often, raise `MPEGTS_CLIENT_QUEUE_MAXSIZE` — each chunk is ~64 KB, and the buffer should comfortably exceed one DASH segment burst (a 6 s segment at 3 Mbps is already ~34 chunks).
+2. **`dropped_chunks` stays 0 but the player floods `PES packet size mismatch` / `Packet corrupt`** → data reached the client intact from this proxy; the corruption is upstream (a dirty source) or a remux-format issue:
+   - Compare with direct playback of the source: `ffplay "<source-url>"` — the same errors without the proxy mean a dirty source (common with IPTV restreams: splices, missing IDRs, discontinuities).
+   - `ffprobe <source-url>` and check the audio profile: **HE-AAC** (SBR/PS) copied into MPEG-TS as ADTS can decode as garbage — look for `SBR was found before the first channel element` in the player log. Try LATM encapsulation: `MPEGTS_FFMPEG_EXTRA_OUT="-mpegts_flags latm"`, or drop audio as a stopgap: `MPEGTS_FFMPEG_EXTRA_OUT="-an"`.
+   - `Invalid video timestamp` jumps at otherwise-clean times are splice/discontinuity markers from the source.
 
 ### 401 / 403 / 503 "refusing all requests"
 - Send `Authorization: Bearer <token>`; the token comes from `MPEGTS_AUTH_TOKEN`
@@ -383,12 +406,14 @@ Done:
 - [x] Prometheus metrics endpoint — `GET /metrics`
 - [x] Input URL validation (prevent SSRF) — scheme + IP checks (defense-in-depth; pair with network-layer egress filtering)
 - [x] Configurable timeout on FFmpeg startup — `MPEGTS_SPAWN_WAIT_TIMEOUT`, `MPEGTS_PREFLIGHT_TIMEOUT`
+- [x] Packet-aligned live-edge fan-out — 188-byte packet grid + PES-anchored batch eviction + PES-anchored late joins (no mid-packet splices, no demuxer resync cascades)
 
 Potential improvements:
 
 - [ ] Rate limiting per IP
 - [ ] Stream quality/bitrate selection
 - [ ] Per-client API keys / token rotation
+- [ ] Keyframe-anchored live-edge joins (skip to the next IDR/GOP start instead of the next PES start, for instant clean video after a jump)
 - [ ] OpenMetrics exposition (`application/openmetrics-text`)
 
 ## License

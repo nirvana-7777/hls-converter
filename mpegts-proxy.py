@@ -3,6 +3,12 @@ MPEG-TS Stream Proxy
 
 Convert DASH/HLS/other sources to MPEG-TS on the fly for direct streaming.
 
+Live-edge fan-out: every chunk handed to a client is a whole number of
+188-byte TS packets, and a client that falls behind is skipped ahead to
+the live edge in ONE batch that resumes on a PES frame start — the byte
+stream is never spliced mid-packet (mid-packet splices are what showed up
+as 'Packet corrupt' / 'PES packet size mismatch' spam in client demuxers).
+
 Security model:
   - pipe:// is DISABLED unless MPEGTS_ALLOW_PIPE=1. It executes arbitrary
     commands, so treat it as a remote-code-execution surface (it remains
@@ -72,7 +78,7 @@ MAX_STREAM_AGE = _env_int("MPEGTS_MAX_STREAM_AGE", 3600)      # s; only evicts s
 IDLE_TIMEOUT = _env_int("MPEGTS_IDLE_TIMEOUT", 300)           # s
 CLEANUP_INTERVAL = _env_int("MPEGTS_CLEANUP_INTERVAL", 30)    # s
 STREAM_READ_SIZE = _env_int("MPEGTS_READ_SIZE", 65800)        # 350 x 188-byte TS packets
-CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 32)   # chunks/client (~2 MB)
+CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 64)   # chunks/client (~4 MB; must exceed one DASH segment burst. Overflow evicts to half capacity in ONE batch — see ClientBuffer.)
 MAX_CLIENTS_PER_STREAM = _env_int("MPEGTS_MAX_CLIENTS_PER_STREAM", 50)
 SPAWN_WAIT_TIMEOUT = _env_int("MPEGTS_SPAWN_WAIT_TIMEOUT", 30)       # s; follower waits for leader
 PREFLIGHT_TIMEOUT = _env_int("MPEGTS_PREFLIGHT_TIMEOUT", 5)          # s; first-byte wait pre-headers
@@ -81,6 +87,12 @@ ALLOW_PIPE = _env_bool("MPEGTS_ALLOW_PIPE", False)
 AUTH_TOKEN = os.environ.get("MPEGTS_AUTH_TOKEN")
 AUTH_DISABLED = _env_bool("MPEGTS_AUTH_DISABLED", False)
 USER_AGENT = os.environ.get("MPEGTS_USER_AGENT")              # optional; via ffmpeg -user_agent
+# Escape hatch: extra ffmpeg args (shlex-split), injected verbatim.
+# IN:  before -i (input side, e.g. -headers "Authorization: Bearer ...").
+# OUT: before the output target (e.g. -mpegts_flags latm for HE-AAC sources,
+#      -an to drop audio). Lets operators tune remuxing without code changes.
+FFMPEG_EXTRA_IN = shlex.split(os.environ.get("MPEGTS_FFMPEG_EXTRA_IN", "") or "")
+FFMPEG_EXTRA_OUT = shlex.split(os.environ.get("MPEGTS_FFMPEG_EXTRA_OUT", "") or "")
 
 # rtsp/rtp/udp/rtmp/mms legitimately target LAN hosts (cameras, encoders).
 SCHEMES_ALLOW_PRIVATE = {"rtsp", "rtp", "udp", "rtmp", "mms"}
@@ -240,27 +252,171 @@ class SpawnResult(enum.Enum):
     SPAWN_TIMEOUT = "spawn timed out"
 
 
-def _force_put(q: asyncio.Queue, item) -> None:
-    """put_nowait with drop-oldest semantics; used for chunks and sentinels.
+# ===== TS packet grid / PES anchoring =====
 
-    Drop-oldest suits live TV: a client that falls behind skips ahead to the
-    newest chunk instead of stalling behind a growing backlog. The None
-    sentinel rides the same path, so on a full queue it evicts the oldest
-    queued chunk (possibly the stream's last) to guarantee a clean close —
-    losing a final chunk is invisible for live TV.
+# Every chunk fanned out to clients is a whole number of 188-byte MPEG-TS
+# packets (we generate the TS ourselves with '-f mpegts', which always
+# writes 188-byte packets). Keeping the grid across fan-out, live-edge
+# evictions and late joins is what prevents client-side demuxers from
+# spiraling into 'Packet corrupt' / 'PES packet size mismatch' spam: an
+# eviction that splices the stream mid-packet shifts the sync-byte phase
+# and every following packet is misparsed until the demuxer rescans.
+TS_PACKET_SIZE = 188
+
+
+def _first_pusi_offset(data: bytes) -> int:
+    """Offset of the first TS packet whose payload_unit_start_indicator
+    (PUSI) bit is set, scanning on the 188-byte grid. -1 when none.
+
+    `data` must start on a packet boundary — guaranteed for every chunk,
+    because the pump only emits whole packets."""
+    last = len(data) - TS_PACKET_SIZE
+    i = 0
+    while i <= last:
+        if data[i] == 0x47 and (data[i + 1] & 0x40):
+            return i
+        i += TS_PACKET_SIZE
+    return -1
+
+
+def _trim_head_to_pusi(chunks: deque[bytes]) -> tuple[int, int]:
+    """Drop leading chunks/bytes so the head starts exactly on a PES start
+    (PUSI packet) — playback then resumes on a frame boundary instead of
+    mid-frame. Returns (chunks_dropped, bytes_dropped). Leaves the buffer
+    untouched when no PUSI exists anywhere (not seen for real TS, but the
+    safe fallback for odd pipe:// producers)."""
+    drop_chunks = 0
+    drop_bytes = 0
+    partial = -1
+    for head in chunks:
+        off = _first_pusi_offset(head)
+        if off == 0:
+            break
+        if off < 0:
+            drop_chunks += 1
+            drop_bytes += len(head)
+        else:
+            partial = off
+            drop_bytes += off
+            break
+    if partial < 0 and drop_chunks >= len(chunks):
+        return 0, 0            # no PES start anywhere — keep the data
+    for _ in range(drop_chunks):
+        chunks.popleft()
+    if partial >= 0 and chunks:
+        chunks[0] = chunks[0][partial:]
+    return drop_chunks, drop_bytes
+
+
+class ClientBuffer:
+    """Bounded per-client FIFO of packet-aligned TS chunks.
+
+    Owns the live-edge policy (replaces asyncio.Queue + drop-oldest):
+
+      * evictions are BATCHED — when the client falls behind, drop to half
+        capacity in one go and re-anchor the head on the next PES start,
+        so an overflow episode costs a single clean seam instead of one
+        mid-packet splice per chunk (the old behavior produced cascading
+        'Packet corrupt' / 'PES packet size mismatch' in players);
+      * the end-of-stream sentinel rides the tail and never evicts data;
+      * every skip is counted per client and per stream — never silent.
+
+    Note: a live-edge jump still shows up client-side as a continuity
+    counter discontinuity (raw TS has no drop signaling); players resync
+    within a frame. This buffer guarantees they never have to resync the
+    byte stream itself.
     """
-    try:
-        q.put_nowait(item)
-    except asyncio.QueueFull:
-        with contextlib.suppress(asyncio.QueueEmpty):
-            q.get_nowait()
-        with contextlib.suppress(asyncio.QueueFull):
-            q.put_nowait(item)
+
+    def __init__(self, max_chunks: int, stream: "StreamInfo | None" = None,
+                 start_on_pusi: bool = False) -> None:
+        self._chunks: deque[bytes] = deque()
+        self._max_chunks = max(1, int(max_chunks))
+        self._stream = stream
+        self._armed = start_on_pusi   # late join: skip to the first PES start
+        self._closed = False
+        self._event = asyncio.Event()
+        self.dropped_chunks = 0       # evicted by live-edge trims
+        self.dropped_bytes = 0
+        self.join_skipped_chunks = 0  # bytes skipped to start on a frame boundary
+        self.join_skipped_bytes = 0
+
+    # ----- producer side (pump task) -----
+
+    def push(self, chunk: bytes) -> None:
+        self._chunks.append(chunk)
+        if self._armed:
+            self._skip_to_pusi()
+        if len(self._chunks) > self._max_chunks:
+            self._trim_to_live_edge()
+        self._event.set()
+
+    def push_sentinel(self) -> None:
+        """End of stream. Rides the tail: the writer drains queued data
+        first, then observes the close (queued data is never evicted)."""
+        self._closed = True
+        self._event.set()
+
+    # ----- live-edge policy -----
+
+    def _skip_to_pusi(self) -> None:
+        """Late join: drop everything before the first PES start. Counted
+        separately from evictions — a late join is normal operation, not a
+        client falling behind."""
+        chunks, n_bytes = _trim_head_to_pusi(self._chunks)
+        if chunks or n_bytes:
+            self.join_skipped_chunks += chunks
+            self.join_skipped_bytes += n_bytes
+            logger.debug(
+                f"client join skipped {chunks} chunks / {n_bytes} bytes "
+                f"to start on a PES boundary"
+            )
+        # Stay armed until the head actually sits on a PES start: when the
+        # buffer holds no PUSI yet (short burst, odd producer), the trim is
+        # a no-op and the next push must retry.
+        if self._chunks and _first_pusi_offset(self._chunks[0]) == 0:
+            self._armed = False
+
+    def _trim_to_live_edge(self) -> None:
+        """One-batch eviction: down to half capacity, then re-anchor the
+        head on the next PES start."""
+        target = max(1, self._max_chunks // 2)
+        popped = popped_bytes = 0
+        while len(self._chunks) > target:
+            popped_bytes += len(self._chunks.popleft())
+            popped += 1
+        anchored_chunks, anchored_bytes = _trim_head_to_pusi(self._chunks)
+        dropped_chunks = popped + anchored_chunks
+        dropped_bytes = popped_bytes + anchored_bytes
+        if dropped_chunks or dropped_bytes:
+            self.dropped_chunks += dropped_chunks
+            self.dropped_bytes += dropped_bytes
+            if self._stream is not None:
+                self._stream.note_drop(dropped_chunks, dropped_bytes)
+
+    # ----- consumer side (handler task) -----
+
+    async def get(self, timeout: float) -> bytes | None:
+        """Next chunk, or None once closed and fully drained. Raises
+        asyncio.TimeoutError when nothing arrives within `timeout`."""
+        while True:
+            if self._chunks:
+                return self._chunks.popleft()
+            if self._closed:
+                return None
+            self._event.clear()
+            # No await between the checks above and the wait below, so a
+            # push cannot interleave and be lost (single event loop).
+            await asyncio.wait_for(self._event.wait(), timeout)
+
+    def fully_drained(self) -> bool:
+        """True when no buffered chunks remain (a closed buffer drains
+        through get() -> None)."""
+        return not self._chunks
 
 
 @dataclass
 class StreamInfo:
-    """Per-stream state: process, fan-out queues, diagnostics."""
+    """Per-stream state: process, fan-out buffers, diagnostics."""
 
     stream_id: str
     url: str                                   # canonical key (original URL / pipe command)
@@ -268,27 +424,54 @@ class StreamInfo:
     process: asyncio.subprocess.Process
     created: float = field(default_factory=time.time)
     last_client_disconnect: float | None = None
-    subscribers: set[asyncio.Queue] = field(default_factory=set)
+    subscribers: set[ClientBuffer] = field(default_factory=set)
     pump_task: asyncio.Task | None = None
     stderr_task: asyncio.Task | None = None
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=50))
     bytes_read: int = 0                        # bytes read from the source stdout (pre fan-out)
+    dropped_chunks: int = 0                    # chunks evicted by live-edge trims (clients that fell behind)
+    dropped_bytes: int = 0                     # bytes skipped by the same trims
+    drop_sink: "callable | None" = None        # set by StreamManager: global-counter hook
     stall_events: int = 0                      # informational
+
+    def __post_init__(self) -> None:
+        self._last_drop_log = 0.0
 
     @property
     def client_count(self) -> int:
         return len(self.subscribers)
 
-    def add_subscriber(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=CLIENT_QUEUE_MAXSIZE)
-        self.subscribers.add(q)
+    def add_subscriber(self) -> ClientBuffer:
+        # start_on_pusi: on a fresh stream the first chunk starts at the
+        # PAT (PUSI set) — a no-op there; a late joiner instead skips to
+        # the next PES start so it begins on a frame boundary, never
+        # mid-PES.
+        buf = ClientBuffer(CLIENT_QUEUE_MAXSIZE, stream=self, start_on_pusi=True)
+        self.subscribers.add(buf)
         self.last_client_disconnect = None
-        return q
+        return buf
 
-    def remove_subscriber(self, q: asyncio.Queue) -> None:
-        self.subscribers.discard(q)
+    def remove_subscriber(self, buf: ClientBuffer) -> None:
+        self.subscribers.discard(buf)
         if not self.subscribers:
             self.last_client_disconnect = time.time()
+
+    def note_drop(self, chunks: int, n_bytes: int) -> None:
+        """Account a live-edge eviction (per stream + global sink) and log
+        rate-limited, so a stalling client never floods the log."""
+        first = self.dropped_chunks == 0
+        self.dropped_chunks += chunks
+        self.dropped_bytes += n_bytes
+        if self.drop_sink is not None:
+            self.drop_sink(chunks, n_bytes)
+        now = time.monotonic()
+        if first or (now - self._last_drop_log) > 30.0:
+            self._last_drop_log = now
+            logger.warning(
+                f"stream {self.stream_id}: skipping a lagging client ahead "
+                f"to the live edge (stream total: {self.dropped_chunks} "
+                f"chunks / {self.dropped_bytes} bytes skipped)"
+            )
 
 
 def _ffmpeg_cmd(url: str, name: str) -> list[str]:
@@ -313,6 +496,9 @@ def _ffmpeg_cmd(url: str, name: str) -> list[str]:
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "2",
         "-thread_queue_size", "512",
+        # Escape hatch (MPEGTS_FFMPEG_EXTRA_IN): injected verbatim before -i,
+        # e.g. -headers "Authorization: Bearer ..." for token-gated origins.
+        *FFMPEG_EXTRA_IN,
         "-i", url,
         "-map", "0:v:0",
         "-map", "0:a:0?",
@@ -326,6 +512,9 @@ def _ffmpeg_cmd(url: str, name: str) -> list[str]:
         "-mpegts_copyts", "1",
         "-metadata", f"service_name={name}",
         "-flush_packets", "1",
+        # Escape hatch (MPEGTS_FFMPEG_EXTRA_OUT): injected verbatim before the
+        # output target, e.g. -mpegts_flags latm (HE-AAC sources), -an.
+        *FFMPEG_EXTRA_OUT,
         "pipe:1",
     ]
     return cmd
@@ -341,6 +530,8 @@ class StreamManager:
         self._spawning: dict[str, asyncio.Future] = {}  # key -> future resolved by the leader
         # Cumulative counters (monotonic — safe for Prometheus rate()).
         self._total_bytes_read = 0
+        self._total_dropped_chunks = 0
+        self._total_dropped_bytes = 0
         self._total_stalls = 0
         self._total_streams_created = 0
 
@@ -403,11 +594,10 @@ class StreamManager:
         info = self.streams.pop(key, None)
         if info is None:
             return
-        # Wake every waiting handler. The sentinel may evict a subscriber's
-        # last queued chunk on a full queue (see _force_put) — acceptable for
-        # live TV; the client still gets a clean close.
-        for q in list(info.subscribers):
-            _force_put(q, None)
+        # Wake every waiting handler. The sentinel rides the buffer tail, so
+        # any still-queued data is delivered before the clean close.
+        for buf in list(info.subscribers):
+            buf.push_sentinel()
         info.subscribers.clear()
 
         proc = info.process
@@ -464,10 +654,17 @@ class StreamManager:
     # ----- pump -----
 
     async def _pump(self, info: StreamInfo) -> None:
-        """Single reader -> bounded fan-out. A slow client drops chunks and
-        stays near the live edge instead of stalling the reader or being
-        starved forever."""
+        """Single reader -> bounded fan-out.
+
+        Reads are re-anchored on the 188-byte TS packet grid before
+        fan-out, so every chunk a client can ever receive is a whole
+        number of packets and live-edge evictions can never splice the
+        stream mid-packet (that splice is what showed up as 'Packet
+        corrupt' / 'PES packet size mismatch' in client demuxers). A
+        client that falls behind is trimmed to the live edge in one batch
+        by its ClientBuffer; the end sentinel rides the tail."""
         proc = info.process
+        carry = bytearray()
         try:
             while True:
                 try:
@@ -484,14 +681,26 @@ class StreamManager:
                 info.bytes_read += len(chunk)
                 self._total_bytes_read += len(chunk)
 
-                for q in list(info.subscribers):
-                    _force_put(q, chunk)
+                carry += chunk
+                emit = len(carry) - len(carry) % TS_PACKET_SIZE
+                if emit:
+                    payload = bytes(carry[:emit])
+                    del carry[:emit]
+                    for buf in list(info.subscribers):
+                        buf.push(payload)
+
+            if carry:
+                # EOF with a trailing partial packet: only possible for a
+                # truncated source or a non-TS pipe:// producer. Forward it
+                # rather than silently losing bytes.
+                payload = bytes(carry)
+                for buf in list(info.subscribers):
+                    buf.push(payload)
         finally:
-            # EOF/error/exit: wake all handlers so they close cleanly (the
-            # sentinel may evict the final buffered chunk on a full queue;
-            # see _force_put).
-            for q in list(info.subscribers):
-                _force_put(q, None)
+            # EOF/error/exit: wake all handlers so they close cleanly. The
+            # sentinel rides the tail; queued data is drained first.
+            for buf in list(info.subscribers):
+                buf.push_sentinel()
 
     # ----- spawn / get -----
 
@@ -606,6 +815,7 @@ class StreamManager:
                 url=url_or_command,
                 display_name=name,
                 process=proc,
+                drop_sink=self._account_drops,
             )
             self.streams[url_or_command] = info
             self._total_streams_created += 1
@@ -631,6 +841,11 @@ class StreamManager:
         info.stall_events += 1
         self._total_stalls += 1
 
+    def _account_drops(self, chunks: int, n_bytes: int) -> None:
+        """drop_sink target: global live-edge counters for /health + /metrics."""
+        self._total_dropped_chunks += chunks
+        self._total_dropped_bytes += n_bytes
+
     # ----- introspection -----
 
     def health_snapshot(self) -> dict:
@@ -647,6 +862,8 @@ class StreamManager:
             "max_streams": self.max_streams,
             "totals": {
                 "bytes_read": self._total_bytes_read,
+                "dropped_chunks": self._total_dropped_chunks,
+                "dropped_bytes": self._total_dropped_bytes,
                 "stalls": self._total_stalls,
                 "streams_created": self._total_streams_created,
             },
@@ -659,6 +876,8 @@ class StreamManager:
                     "clients": i.client_count,
                     "alive": i.process.returncode is None,
                     "bytes_read": i.bytes_read,
+                    "dropped_chunks": i.dropped_chunks,
+                    "dropped_bytes": i.dropped_bytes,
                     "stall_events": i.stall_events,
                     "last_stderr": list(i.stderr_tail)[-3:],
                 }
@@ -691,6 +910,12 @@ class StreamManager:
             "# HELP mpegts_proxy_streams_created_total Streams ever created",
             "# TYPE mpegts_proxy_streams_created_total counter",
             f"mpegts_proxy_streams_created_total {self._total_streams_created}",
+            "# HELP mpegts_proxy_dropped_chunks_total Chunks evicted from full client queues (live-edge drops)",
+            "# TYPE mpegts_proxy_dropped_chunks_total counter",
+            f"mpegts_proxy_dropped_chunks_total {self._total_dropped_chunks}",
+            "# HELP mpegts_proxy_dropped_bytes_total Bytes skipped by live-edge evictions (packet-aligned, PES-anchored)",
+            "# TYPE mpegts_proxy_dropped_bytes_total counter",
+            f"mpegts_proxy_dropped_bytes_total {self._total_dropped_bytes}",
         ]
         return "\n".join(lines) + "\n"
 
@@ -768,12 +993,12 @@ async def stream_handler(request: web.Request) -> web.Response:
             status=503,
         )
 
-    client_q = info.add_subscriber()
+    client_buf = info.add_subscriber()
     # Race guard. There is no await between add_subscriber() and this check,
     # so the pair is atomic under the event loop. The stream may have died
     # or been torn down between get_or_create() and this subscription
     # (cleanup loop, shutdown, or a concurrent request pruning a dead
-    # source): a queue added that late can miss the pump's sentinel fan-out
+    # source): a buffer added that late can miss the pump's sentinel fan-out
     # entirely and end the response as 200 with zero bytes delivered. A
     # reaped source or a done pump can never feed a fresh subscriber anyway
     # (see the loop's terminal condition below), and an info that is no
@@ -784,7 +1009,7 @@ async def stream_handler(request: web.Request) -> web.Response:
         or (info.pump_task is not None and info.pump_task.done())
         or mgr.streams.get(raw_url) is not info
     ):
-        info.remove_subscriber(client_q)
+        info.remove_subscriber(client_buf)
         return web.json_response({"error": "stream terminated"}, status=503)
 
     response = web.StreamResponse(
@@ -807,13 +1032,13 @@ async def stream_handler(request: web.Request) -> web.Response:
             # No more data can ever arrive once the source is reaped or the
             # pump has exited; drain what's queued, then close.
             pump_done = info.pump_task is not None and info.pump_task.done()
-            if (info.process.returncode is not None or pump_done) and client_q.empty():
+            if (info.process.returncode is not None or pump_done) and client_buf.fully_drained():
                 break
 
             # Longer timeout during startup, tighter once flowing.
             timeout = 10.0 if chunk_count < 10 else 5.0
             try:
-                chunk = await asyncio.wait_for(client_q.get(), timeout=timeout)
+                chunk = await client_buf.get(timeout)
             except asyncio.TimeoutError:
                 stall_count += 1
                 mgr.note_stall(info)
@@ -844,10 +1069,14 @@ async def stream_handler(request: web.Request) -> web.Response:
 
             now = time.monotonic()
             if now - last_log > 30:
+                skipped = ""
+                if client_buf.dropped_chunks:
+                    skipped = (f", {client_buf.dropped_chunks} chunks skipped "
+                               f"(live edge)")
                 logger.info(
                     f"stream {info.stream_id}: client at {chunk_count} chunks, "
                     f"{info.client_count} viewers, "
-                    f"{bytes_delivered / 1048576:.1f} MB delivered"
+                    f"{bytes_delivered / 1048576:.1f} MB delivered{skipped}"
                 )
                 last_log = now
 
@@ -856,7 +1085,7 @@ async def stream_handler(request: web.Request) -> web.Response:
     except Exception as e:
         logger.error(f"handler error on {info.stream_id}: {e}")
     finally:
-        info.remove_subscriber(client_q)
+        info.remove_subscriber(client_buf)
         if info.client_count == 0:
             logger.info(
                 f"last client left {info.stream_id}; "

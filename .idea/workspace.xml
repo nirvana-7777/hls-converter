@@ -4,8 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="Initial">
-      <change beforePath="$PROJECT_DIR$/.idea/hls-converter.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/hls-converter.iml" afterDir="false" />
+    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="change code">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/mpegts-proxy.py" beforeDir="false" afterPath="$PROJECT_DIR$/mpegts-proxy.py" afterDir="false" />
@@ -341,7 +340,15 @@
       <option name="project" value="LOCAL" />
       <updated>1770642541816</updated>
     </task>
-    <option name="localTasksCounter" value="35" />
+    <task id="LOCAL-00035" summary="change code">
+      <option name="closed" value="true" />
+      <created>1793978758235</created>
+      <option name="number" value="00035" />
+      <option name="presentableId" value="LOCAL-00035" />
+      <option name="project" value="LOCAL" />
+      <updated>1793978758235</updated>
+    </task>
+    <option name="localTasksCounter" value="36" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -349,6 +356,7 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Initial" />
-    <option name="LAST_COMMIT_MESSAGE" value="Initial" />
+    <MESSAGE value="change code" />
+    <option name="LAST_COMMIT_MESSAGE" value="change code" />
   </component>
 </project>
