@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 permissions:
   contents: read
@@ -40,7 +40,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt pytest flake8
 
-      - name: flake8 (blocking: syntax errors, undefined names)
+      - name: "flake8 (blocking: syntax errors, undefined names)"
         run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
       - name: flake8 (advisory)
@@ -51,10 +51,15 @@ jobs:
 
       - name: Smoke test (startup + /health)
         run: |
-          python mpegts-proxy.py &
+          python mpegts-proxy.py > /tmp/app.log 2>&1 &
           APP_PID=$!
           trap 'kill $APP_PID 2>/dev/null || true' EXIT
-          curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/health
+          if ! curl -fsS --retry 30 --retry-delay 1 --retry-connrefused --retry-all-errors \
+               http://127.0.0.1:8000/health; then
+            echo "--- app log ---"
+            cat /tmp/app.log
+            exit 1
+          fi
 
   docker:
     needs: test
@@ -120,12 +125,14 @@ jobs:
       security-events: write
     steps:
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master   # pin to a release tag or commit SHA
+        uses: aquasecurity/trivy-action@0.28.0   # pinned
         with:
           image-ref: ${{ env.DOCKER_IMAGE }}@${{ needs.docker.outputs.digest }}
           format: 'sarif'
           output: 'trivy-results.sarif'
-        continue-on-error: true
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'          # non-blocking, but reports real findings
+        continue-on-error: false  # don't hide action/network failures
 
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
@@ -142,7 +149,9 @@ jobs:
       - name: Workflow status
         run: |
           echo "Test: ${{ needs.test.result }}  Docker: ${{ needs.docker.result }}  Security: ${{ needs.security-scan.result }}"
-          if [[ "${{ needs.test.result }}" == "success" && ( "${{ needs.docker.result }}" == "success" || "${{ needs.docker.result }}" == "skipped" ) ]]; then
+          if [[ "${{ needs.test.result }}" == "success" && \
+                ( "${{ needs.docker.result }}" == "success" || "${{ needs.docker.result }}" == "skipped" ) && \
+                ( "${{ needs.security-scan.result }}" == "success" || "${{ needs.security-scan.result }}" == "skipped" ) ]]; then
             echo "Build completed successfully"
           else
             echo "Build failed - check logs above"
