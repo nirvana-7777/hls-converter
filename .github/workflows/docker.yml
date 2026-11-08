@@ -126,7 +126,7 @@ jobs:
       security-events: write
     steps:
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.28.0   # pinned
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.DOCKER_IMAGE }}@${{ needs.docker.outputs.digest }}
           format: 'sarif'
