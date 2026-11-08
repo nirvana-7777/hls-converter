@@ -4,13 +4,20 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="change mpd edge">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="fix docker.yml">
+      <change afterPath="$PROJECT_DIR$/test_mpegts_proxy.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Python Script" />
+      </list>
+    </option>
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
@@ -378,7 +385,23 @@
       <option name="project" value="LOCAL" />
       <updated>1794138310587</updated>
     </task>
-    <option name="localTasksCounter" value="40" />
+    <task id="LOCAL-00040" summary="fix docker.yml">
+      <option name="closed" value="true" />
+      <created>1794143371036</created>
+      <option name="number" value="00040" />
+      <option name="presentableId" value="LOCAL-00040" />
+      <option name="project" value="LOCAL" />
+      <updated>1794143371036</updated>
+    </task>
+    <task id="LOCAL-00041" summary="fix docker.yml">
+      <option name="closed" value="true" />
+      <created>1794143384059</created>
+      <option name="number" value="00041" />
+      <option name="presentableId" value="LOCAL-00041" />
+      <option name="project" value="LOCAL" />
+      <updated>1794143384059</updated>
+    </task>
+    <option name="localTasksCounter" value="42" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -391,6 +414,7 @@
     <MESSAGE value="integrate with backend" />
     <MESSAGE value="change fan out" />
     <MESSAGE value="change mpd edge" />
-    <option name="LAST_COMMIT_MESSAGE" value="change mpd edge" />
+    <MESSAGE value="fix docker.yml" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix docker.yml" />
   </component>
 </project>
