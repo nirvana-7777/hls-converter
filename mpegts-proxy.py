@@ -134,6 +134,7 @@ WATCHDOG_INTERVAL = 5                                         # s between source
 STALL_TIMEOUT = _env_int("MPEGTS_STALL_TIMEOUT", 20)          # s without a source byte -> kill (flowing stream)
 STARTUP_TIMEOUT = _env_int("MPEGTS_STARTUP_TIMEOUT", 45)      # s without the FIRST byte -> kill (probing is slow)
 RW_TIMEOUT = _env_int("MPEGTS_RW_TIMEOUT", 15)                # s; ffmpeg -rw_timeout: prefer dying over hanging
+JOIN_KEYFRAME_TIMEOUT = _env_int("MPEGTS_JOIN_KEYFRAME_TIMEOUT", 10)  # s a joining client waits for a video keyframe before settling for a PES start
 STREAM_READ_SIZE = _env_int("MPEGTS_READ_SIZE", 65800)        # 350 x 188-byte TS packets
 CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 64)   # chunks/client (~4 MB; must exceed one DASH segment burst. Overflow evicts to half capacity in ONE batch — see ClientBuffer.)
 MAX_CLIENTS_PER_STREAM = _env_int("MPEGTS_MAX_CLIENTS_PER_STREAM", 50)
@@ -529,9 +530,15 @@ class ClientBuffer:
     Owns the live-edge policy:
 
       * a late joiner is HELD until the buffer contains a video keyframe,
-        then released starting with PAT+PMT and that keyframe. (If no
-        keyframe shows up for a while it settles for a PES start; it is
-        never held forever.)
+        then released starting with PAT+PMT and that keyframe. The wait is
+        bounded by TIME (JOIN_KEYFRAME_TIMEOUT), not by chunk count: how many
+        chunks a GOP spans depends on the bitrate (a 2 s GOP at 5 Mbit/s is
+        ~20 chunks) and live DASH sources burst, so a chunk limit releases
+        clients mid-GOP — no SPS/PPS, undecodable until the next keyframe.
+        After the timeout it settles for a PES start.
+      * while held, the buffer is capped by silently discarding the oldest
+        chunks (nothing useful is lost: no client could start there, and it
+        is not counted as a live-edge drop).
       * evictions are BATCHED — when the client falls behind, drop to half
         capacity in one go and re-anchor the head on the next keyframe (PES
         start as fallback), so an overflow episode costs a single clean
@@ -553,7 +560,7 @@ class ClientBuffer:
         self._stream = stream
         self._psi = psi
         self._armed = start_on_anchor  # late join: hold until the first anchor
-        self._armed_pushes = 0
+        self._armed_since = time.monotonic()
         self._closed = False
         self._event = asyncio.Event()
         self.dropped_chunks = 0       # evicted by live-edge trims
@@ -567,7 +574,7 @@ class ClientBuffer:
         self._chunks.append(chunk)
         if self._armed:
             self._release_on_anchor()
-        if len(self._chunks) > self._max_chunks:
+        elif len(self._chunks) > self._max_chunks:
             self._trim_to_live_edge()
         if not self._armed:
             self._event.set()
@@ -585,10 +592,10 @@ class ClientBuffer:
         """Late join: drop everything before the first anchor and release
         the client. Counted separately from evictions — a late join is
         normal operation, not a client falling behind."""
-        self._armed_pushes += 1
         video_pid = self._psi.video_pid if self._psi is not None else None
-        if self._armed_pushes > max(4, self._max_chunks // 4):
-            video_pid = None          # no keyframe yet: settle for a PES start
+        timed_out = (time.monotonic() - self._armed_since) > JOIN_KEYFRAME_TIMEOUT
+        if timed_out:
+            video_pid = None          # no keyframe in time: settle for a PES start
         found, chunks, n_bytes = _trim_head_to_anchor(self._chunks, video_pid)
         if found:
             if chunks or n_bytes:
@@ -602,8 +609,14 @@ class ClientBuffer:
                 if prefix:
                     self._chunks.appendleft(prefix)   # tables first
             self._armed = False
-        elif self._armed_pushes > max(8, self._max_chunks // 2):
-            self._armed = False       # odd producer: never stall a client forever
+        elif timed_out:
+            self._armed = False       # not even a PES start: odd producer, flush what we have
+        else:
+            # Still waiting for a keyframe: bound the memory, silently.
+            while len(self._chunks) > self._max_chunks:
+                dropped = self._chunks.popleft()
+                self.join_skipped_chunks += 1
+                self.join_skipped_bytes += len(dropped)
 
     def _trim_to_live_edge(self) -> None:
         """One-batch eviction: down to half capacity, then re-anchor the
@@ -1662,36 +1675,41 @@ async def _serve_live(request: web.Request, mgr: StreamManager, key: str, name: 
             return _json_error(504, result.value, headers=retry)
         return _json_error(502, result.value, hint="is ffmpeg installed and on PATH?")
 
-    # Pre-flight (first subscriber only): wait briefly for the first byte
-    # BEFORE committing headers, so a dead source still yields a real 502
-    # with diagnostics instead of 200 + empty body.
-    if info.client_count == 0:
-        deadline = time.monotonic() + PREFLIGHT_TIMEOUT
-        while time.monotonic() < deadline:
-            if info.bytes_read > 0 or info.process.returncode is not None:
-                break
-            await asyncio.sleep(0.05)
-        if info.bytes_read == 0 and info.process.returncode is not None:
-            await _await_stderr(info)
-            return _startup_failure(info)
-
     if info.client_count >= MAX_CLIENTS_PER_STREAM:
         return _json_error(
             503, f"too many clients on this stream (max {MAX_CLIENTS_PER_STREAM})",
             headers={"Retry-After": str(RETRY_AFTER)},
         )
 
+    # Subscribe BEFORE waiting for the first byte. A client that attaches
+    # only after the first chunk has arrived never sees the start of the
+    # stream (the first keyframe is spread over several chunks), so it would
+    # wait a whole extra GOP for the next one.
     client_buf = info.add_subscriber()
-    # Race guard. There is no await between add_subscriber() and this check,
-    # so the pair is atomic under the event loop. The stream may have died
-    # or been torn down between get_or_create() and this subscription
-    # (cleanup loop, shutdown, or a concurrent request pruning a dead
-    # source): a buffer added that late can miss the pump's sentinel fan-out
-    # entirely and end the response as 200 with zero bytes delivered. A
-    # reaped source or a done pump can never feed a fresh subscriber anyway
-    # (see the loop's terminal condition below), and an info that is no
-    # longer the one registered under this key has been terminated (or
-    # replaced by a respawn) — so unsubscribe and fail fast instead.
+
+    # Pre-flight (fresh stream): wait for the first byte BEFORE committing
+    # headers, so a dead source still yields a real 502 with diagnostics
+    # instead of 200 + empty body.
+    if info.bytes_read == 0:
+        deadline = time.monotonic() + PREFLIGHT_TIMEOUT
+        while time.monotonic() < deadline:
+            if info.bytes_read > 0 or info.process.returncode is not None:
+                break
+            await asyncio.sleep(0.05)
+        if info.bytes_read == 0 and info.process.returncode is not None:
+            info.remove_subscriber(client_buf)
+            await _await_stderr(info)
+            return _startup_failure(info)
+
+    # Race guard. The stream may have died or been torn down between
+    # get_or_create() and now (cleanup loop, shutdown, watchdog, or a
+    # concurrent request pruning a dead source): a buffer added that late
+    # can miss the pump's sentinel fan-out entirely and end the response as
+    # 200 with zero bytes delivered. A reaped source or a done pump can never
+    # feed a fresh subscriber anyway (see the loop's terminal condition
+    # below), and an info that is no longer the one registered under this
+    # key has been terminated (or replaced by a respawn) — so unsubscribe
+    # and fail fast instead.
     if (
         info.process.returncode is not None
         or (info.pump_task is not None and info.pump_task.done())
