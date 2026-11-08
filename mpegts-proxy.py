@@ -1539,6 +1539,9 @@ def _json_error(status: int, message: str, *, hint: str | None = None,
 
 
 def _backend_error_response(e: BackendError) -> web.Response:
+    # Visible in the log: a request that fails before ffmpeg is spawned would
+    # otherwise leave no trace there at all.
+    logger.warning(f"backend lookup failed ({e.status}): {e.message}")
     headers = {"Retry-After": str(RETRY_AFTER)} if e.status == 503 else None
     return _json_error(e.status, e.message, hint=e.hint, headers=headers)
 
