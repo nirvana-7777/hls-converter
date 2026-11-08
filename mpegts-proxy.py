@@ -40,6 +40,13 @@ one-time provider tokens are not resolved twice. The manifest is also read
 to pick the highest-bandwidth HLS variant / DASH representation, because
 the backend can only collapse variants on paths that rewrite the manifest.
 
+Live DASH starts near the live edge: ffmpeg's DASH demuxer begins at the
+oldest segment of the MPD's time-shift window (60 s for some providers), i.e.
+a minute behind live after a burst download. For live content the proxy
+therefore serves ffmpeg a copy of the MPD trimmed to the newest
+MPEGTS_DASH_LIVE_WINDOW seconds (default 8, 0 = off) from a loopback-only
+endpoint (/_internal/mpd/<secret>.mpd), re-trimmed on every manifest reload.
+
 The generic `/stream?url=...` endpoint (any URL, optionally pipe://) is OFF
 unless MPEGTS_ALLOW_GENERIC_URL=1.
 
@@ -92,6 +99,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -134,6 +142,13 @@ WATCHDOG_INTERVAL = 5                                         # s between source
 STALL_TIMEOUT = _env_int("MPEGTS_STALL_TIMEOUT", 20)          # s without a source byte -> kill (flowing stream)
 STARTUP_TIMEOUT = _env_int("MPEGTS_STARTUP_TIMEOUT", 45)      # s without the FIRST byte -> kill (probing is slow)
 RW_TIMEOUT = _env_int("MPEGTS_RW_TIMEOUT", 15)                # s; ffmpeg -rw_timeout: prefer dying over hanging
+# Live DASH: how many seconds behind the live edge ffmpeg may start. ffmpeg's
+# DASH demuxer has no start-position option and begins at the OLDEST segment of
+# the MPD's time-shift window (60 s on e.g. magenta2): playback starts a minute
+# behind live after a burst download that can also skip segments. The proxy
+# therefore hands ffmpeg a copy of the MPD trimmed to the newest segments.
+# 0 disables the trimming (ffmpeg gets the backend/upstream MPD directly).
+DASH_LIVE_WINDOW = _env_int("MPEGTS_DASH_LIVE_WINDOW", 8)
 JOIN_KEYFRAME_TIMEOUT = _env_int("MPEGTS_JOIN_KEYFRAME_TIMEOUT", 10)  # s a joining client waits for a video keyframe before settling for a PES start
 STREAM_READ_SIZE = _env_int("MPEGTS_READ_SIZE", 65800)        # 350 x 188-byte TS packets
 CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 64)   # chunks/client (~4 MB; must exceed one DASH segment burst. Overflow evicts to half capacity in ONE batch — see ClientBuffer.)
@@ -173,6 +188,9 @@ ALLOWED_SCHEMES = {"http", "https"} | SCHEMES_ALLOW_PRIVATE
 PROTOCOLS_BACKEND = "http,https,tcp,tls,crypto,pipe"
 PROTOCOLS_GENERIC = "http,https,tcp,tls,crypto,rtmp,rtsp,udp,rtp,mms,pipe"
 
+# Loopback-only endpoint serving the trimmed live MPD to this proxy's own ffmpeg.
+INTERNAL_MPD_PREFIX = "/_internal/mpd/"
+
 # Backend content-type path segments this proxy mirrors.
 LIVE_KINDS = {"channels", "events"}
 ONDEMAND_KINDS = {"vod", "recordings"}
@@ -211,6 +229,8 @@ def _bearer_valid(request: web.Request) -> bool:
 async def auth_middleware(request: web.Request, handler):
     if request.path in OPEN_PATHS:
         return await handler(request)
+    if request.path.startswith(INTERNAL_MPD_PREFIX):
+        return await handler(request)     # ffmpeg cannot send a bearer token; the handler enforces local peer + secret token
     if AUTH_DISABLED:
         return await handler(request)
     if not AUTH_TOKEN:
@@ -683,6 +703,7 @@ class StreamInfo:
     dropped_bytes: int = 0                     # bytes skipped by the same trims
     drop_sink: "callable | None" = None        # set by StreamManager: global-counter hook
     stall_events: int = 0                      # informational
+    mpd_token: str | None = None               # registration of the trimmed-MPD endpoint (released on terminate)
 
     def __post_init__(self) -> None:
         self._last_drop_log = 0.0
@@ -875,6 +896,78 @@ def _plan_streams(text: str) -> tuple[str, list[str]]:
     return "unknown", list(DEFAULT_MAP)
 
 
+_MPD_NS = "urn:mpeg:dash:schema:mpd:2011"
+
+
+def _trim_dash_live(text: str, source_url: str, window_seconds: float) -> str:
+    """The live MPD cut down to its newest `window_seconds`, for ffmpeg.
+
+    Every SegmentTimeline keeps only the segments that end within the window
+    before the live edge (at least two, so ffmpeg always has a look-ahead).
+    $Time$ templates need nothing else; for $Number$ templates startNumber is
+    advanced by the number of dropped segments. Because ffmpeg now fetches
+    this document from the proxy, relative segment URLs would resolve against
+    the proxy — an absolute MPD-level BaseURL pointing at the original MPD's
+    location is therefore set (or an existing one made absolute).
+
+    Static MPDs, open-ended repeats (r=-1) and anything unparseable are
+    returned unchanged."""
+    for prefix, uri in re.findall(r'xmlns(?::(\w+))?="([^"]+)"', text[:4096]):
+        try:
+            ET.register_namespace(prefix, uri)    # keep xsi:, xlink:, default namespace as they were
+        except ValueError:
+            pass
+    root = ET.fromstring(text)
+    if root.get("type") != "dynamic":
+        return text
+    ns = f"{{{_MPD_NS}}}"
+
+    plans = []
+    for tmpl in root.iter(f"{ns}SegmentTemplate"):
+        timeline = tmpl.find(f"{ns}SegmentTimeline")
+        if timeline is None:
+            continue
+        timescale = int(tmpl.get("timescale", "1"))
+        entries: list[tuple[int, int]] = []
+        cur = 0
+        for s_el in timeline.findall(f"{ns}S"):
+            cur = int(s_el.get("t", cur))
+            d = int(s_el.get("d"))
+            r = int(s_el.get("r", "0"))
+            if r < 0:
+                return text                      # open-ended repeat: cannot expand safely
+            for _ in range(r + 1):
+                entries.append((cur, d))
+                cur += d
+        if len(entries) < 3:
+            continue
+        limit = entries[-1][0] + entries[-1][1] - window_seconds * timescale
+        keep_from = next((i for i, (t, d) in enumerate(entries) if t + d > limit), len(entries) - 1)
+        keep_from = min(keep_from, len(entries) - 2)
+        if keep_from > 0:
+            plans.append((tmpl, timeline, entries[keep_from:], keep_from))
+    if not plans:
+        return text
+
+    for tmpl, timeline, kept, dropped in plans:
+        for old in list(timeline):
+            timeline.remove(old)
+        for t, d in kept:
+            ET.SubElement(timeline, f"{ns}S", {"t": str(t), "d": str(d)})
+        if "$Number" in (tmpl.get("media") or ""):
+            tmpl.set("startNumber", str(int(tmpl.get("startNumber", "1")) + dropped))
+
+    base = root.find(f"{ns}BaseURL")
+    if base is not None and (base.text or "").strip():
+        base.text = urljoin(source_url, base.text.strip())
+    else:
+        base = ET.Element(f"{ns}BaseURL")
+        base.text = urljoin(source_url, ".")
+        first_period = next((i for i, child in enumerate(root) if child.tag == f"{ns}Period"), len(root))
+        root.insert(first_period, base)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
+
+
 
 # ===== Stream manager =====
 
@@ -888,6 +981,7 @@ class StreamManager:
         self._watchdog_task: asyncio.Task | None = None
         self._spawn_lock = asyncio.Lock()
         self._spawning: dict[str, asyncio.Future] = {}  # key -> future resolved by the leader
+        self.mpd_sources: dict[str, str] = {}          # token -> original live MPD URL (trimmed-MPD endpoint)
         self._ondemand_slots = 0                       # reserved before the (slow) backend lookup
         # Cumulative counters (monotonic — safe for Prometheus rate()).
         self._total_bytes_read = 0
@@ -1056,6 +1150,8 @@ class StreamManager:
         info = self.streams.pop(key, None)
         if info is None:
             return
+        if info.mpd_token:
+            self.mpd_sources.pop(info.mpd_token, None)
         # Wake every waiting handler. The sentinel rides the buffer tail, so
         # any still-queued data is delivered before the clean close.
         for buf in list(info.subscribers):
@@ -1157,7 +1253,7 @@ class StreamManager:
     async def get_or_create(
         self, key: str, name: str, *, source: str | None = None,
         map_args: list[str] | None = None, kind: str = "unknown",
-        generic: bool = False,
+        generic: bool = False, mpd_token: str | None = None,
     ) -> tuple[StreamInfo | None, SpawnResult]:
         """Shared stream for `key`. `source` is what ffmpeg opens (defaults
         to the key itself); a reused stream ignores source/map_args."""
@@ -1203,7 +1299,7 @@ class StreamManager:
         # including cancellation of the leader — so followers can never hang.
         info: StreamInfo | None = None
         try:
-            info = await self._spawn(key, name, source or key, map_args, kind, generic)
+            info = await self._spawn(key, name, source or key, map_args, kind, generic, mpd_token)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1218,7 +1314,7 @@ class StreamManager:
 
     async def _spawn(self, key: str, name: str, source: str,
                      map_args: list[str] | None, kind: str,
-                     generic: bool) -> StreamInfo | None:
+                     generic: bool, mpd_token: str | None = None) -> StreamInfo | None:
         stream_id = self._stream_id_from_key(key)
 
         if key.startswith("pipe://"):
@@ -1241,6 +1337,7 @@ class StreamManager:
                 process=proc,
                 source_kind=kind,
                 drop_sink=self._account_drops,
+                mpd_token=mpd_token,
             )
             self.streams[key] = info
             self._total_streams_created += 1
@@ -1416,6 +1513,7 @@ class Resolved:
     source: str            # what ffmpeg should open
     map_args: list[str]    # which streams to map (see _plan_streams)
     kind: str              # hls | dash | unknown
+    mpd_token: str | None = None   # set when ffmpeg is pointed at the trimmed-MPD endpoint
 
 
 class BackendError(Exception):
@@ -1563,7 +1661,9 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str) -> str | None:
         return None
 
 
-async def _resolve_source(session: aiohttp.ClientSession, backend_url: str) -> Resolved:
+async def _resolve_source(session: aiohttp.ClientSession, backend_url: str, *,
+                          live: bool = False, mpd_sources: dict[str, str] | None = None,
+                          internal_base: str | None = None) -> Resolved:
     """Ask the backend once, WITHOUT following redirects.
 
       3xx -> ffmpeg opens the redirect target directly (the backend's work is
@@ -1605,7 +1705,17 @@ async def _resolve_source(session: aiohttp.ClientSession, backend_url: str) -> R
         source = backend_url
 
     kind, map_args = _plan_streams(text or "")
-    return Resolved(source=source, map_args=map_args, kind=kind)
+
+    # Live DASH: hand ffmpeg the trimmed MPD instead of the original (see
+    # DASH_LIVE_WINDOW). Stream selection above was planned on the full MPD,
+    # and the trimmed one only drops old segments, so it still applies.
+    mpd_token = None
+    if (kind == "dash" and live and DASH_LIVE_WINDOW > 0 and mpd_sources is not None
+            and internal_base and 'type="dynamic"' in (text or "")[:8192].replace("'", '"')):
+        mpd_token = secrets.token_urlsafe(16)
+        mpd_sources[mpd_token] = source
+        source = f"{internal_base}{INTERNAL_MPD_PREFIX}{mpd_token}.mpd"
+    return Resolved(source=source, map_args=map_args, kind=kind, mpd_token=mpd_token)
 
 
 # ===== HTTP handlers =====
@@ -1653,6 +1763,7 @@ async def _serve_live(request: web.Request, mgr: StreamManager, key: str, name: 
     source: str | None = None
     map_args: list[str] | None = None
     kind = "unknown"
+    mpd_token: str | None = None
 
     # Only a stream that has to be (re)spawned needs the backend lookup; a
     # running one is simply joined.
@@ -1662,11 +1773,14 @@ async def _serve_live(request: web.Request, mgr: StreamManager, key: str, name: 
             res = await resolve()
         except BackendError as e:
             return _backend_error_response(e)
-        source, map_args, kind = res.source, res.map_args, res.kind
+        source, map_args, kind, mpd_token = res.source, res.map_args, res.kind, res.mpd_token
 
     info, result = await mgr.get_or_create(
         key, name, source=source, map_args=map_args, kind=kind, generic=generic,
+        mpd_token=mpd_token,
     )
+    if mpd_token and (info is None or result is not SpawnResult.SPAWNED):
+        mgr.mpd_sources.pop(mpd_token, None)   # another request won the spawn (or it failed): ours is unused
     if info is None:
         retry = {"Retry-After": str(RETRY_AFTER)}
         if result is SpawnResult.MAX_STREAMS:
@@ -1914,12 +2028,60 @@ async def ts_handler(request: web.Request) -> web.StreamResponse:
 
     name = (request.query.get("name") or f"{provider}/{content_id}")[:64]
     backend_url = _backend_stream_url(kind, provider, content_id, request.query)
-    resolve = functools.partial(_resolve_source, request.app["client_session"], backend_url)
+    resolve = functools.partial(
+        _resolve_source, request.app["client_session"], backend_url,
+        live=not ondemand, mpd_sources=mgr.mpd_sources,
+        internal_base=_internal_base(request),
+    )
 
     logger.info(f"{request.remote} -> {kind}/{provider}/{content_id} ({mode})")
     if ondemand:
         return await _serve_ondemand(request, mgr, backend_url, name, resolve, start)
     return await _serve_live(request, mgr, backend_url, name, resolve=resolve)
+
+
+def _internal_base(request: web.Request) -> str | None:
+    """Base URL under which THIS proxy's ffmpeg reaches this very server
+    (the local address of the connection that carries the request)."""
+    sockname = request.transport.get_extra_info("sockname") if request.transport else None
+    if not sockname:
+        return None
+    host = sockname[0]
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{sockname[1]}"
+
+
+def _is_local_peer(request: web.Request) -> bool:
+    peer = request.remote or ""
+    if peer in ("127.0.0.1", "::1"):
+        return True
+    sockname = request.transport.get_extra_info("sockname") if request.transport else None
+    return bool(sockname) and peer == sockname[0]
+
+
+async def internal_mpd_handler(request: web.Request) -> web.Response:
+    """GET /_internal/mpd/<token>.mpd — the live MPD, trimmed to its newest
+    segments. Only this proxy's own ffmpeg may call it: the token is a random
+    secret handed out by _resolve_source and the peer must be local."""
+    mgr: StreamManager = request.app["stream_manager"]
+    source = mgr.mpd_sources.get(request.match_info["token"])
+    if source is None or not _is_local_peer(request):
+        return web.Response(status=404)
+    session: aiohttp.ClientSession = request.app["client_session"]
+    try:
+        async with session.get(source, max_redirects=3) as r:
+            if r.status != 200:
+                return web.Response(status=502)
+            text = (await _read_capped(r)).decode("utf-8", "replace")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"trimmed MPD: source fetch failed: {e}")
+        return web.Response(status=502)
+    try:
+        text = _trim_dash_live(text, str(r.url), DASH_LIVE_WINDOW)
+    except Exception as e:                 # never break playback over the optimisation
+        logger.warning(f"trimmed MPD: falling back to the untrimmed MPD ({e})")
+    return web.Response(text=text, content_type="application/dash+xml")
 
 
 async def generic_handler(request: web.Request) -> web.StreamResponse:
@@ -1991,6 +2153,7 @@ def create_app() -> web.Application:
         "/api/providers/{provider}/vod/{content_id:.+}/stream/index.ts",
         ts_handler,
     )
+    app.router.add_get(INTERNAL_MPD_PREFIX + "{token}.mpd", internal_mpd_handler)
     app.router.add_get("/stream", generic_handler)
     app.router.add_get("/health", health_handler)
     app.router.add_get("/metrics", metrics_handler)

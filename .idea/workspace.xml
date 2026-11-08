@@ -4,7 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="integrate with backend">
+    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="change fan out">
+      <change beforePath="$PROJECT_DIR$/.github/workflows/docker.yml" beforeDir="false" afterPath="$PROJECT_DIR$/.github/workflows/docker.yml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Dockerfile" beforeDir="false" afterPath="$PROJECT_DIR$/Dockerfile" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/mpegts-proxy.py" beforeDir="false" afterPath="$PROJECT_DIR$/mpegts-proxy.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -362,7 +365,15 @@
       <option name="project" value="LOCAL" />
       <updated>1794074830124</updated>
     </task>
-    <option name="localTasksCounter" value="38" />
+    <task id="LOCAL-00038" summary="change fan out">
+      <option name="closed" value="true" />
+      <created>1794119557094</created>
+      <option name="number" value="00038" />
+      <option name="presentableId" value="LOCAL-00038" />
+      <option name="project" value="LOCAL" />
+      <updated>1794119557094</updated>
+    </task>
+    <option name="localTasksCounter" value="39" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -373,6 +384,7 @@
     <MESSAGE value="change code" />
     <MESSAGE value="improve conversion" />
     <MESSAGE value="integrate with backend" />
-    <option name="LAST_COMMIT_MESSAGE" value="integrate with backend" />
+    <MESSAGE value="change fan out" />
+    <option name="LAST_COMMIT_MESSAGE" value="change fan out" />
   </component>
 </project>

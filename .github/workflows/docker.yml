@@ -6,21 +6,27 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ master, main ]
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   DOCKER_IMAGE: nirvana777/hls-converter
-  PYTHON_VERSION: '3.11'  # Changed from 3.9 to match Dockerfile
+  PYTHON_VERSION: '3.11'
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
@@ -28,68 +34,41 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
 
       - name: Install Python dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-aiohttp pytest-cov flake8  # Changed pytest-flask to pytest-aiohttp
+        run: pip install -r requirements.txt pytest flake8
 
-      - name: Lint with flake8
-        run: |
-          # Stop the build if there are Python syntax errors or undefined names
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Exit-zero treats all errors as warnings
-          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-        continue-on-error: true
+      - name: flake8 (blocking: syntax errors, undefined names)
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Check FFmpeg availability
-        run: |
-          ffmpeg -version
-          which ffmpeg
+      - name: flake8 (advisory)
+        run: flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
       - name: Run tests
-        run: |
-          # Add your test commands here when you have tests
-          # Example: python -m pytest tests/ -v --cov=mpegts-proxy
-          echo "⚠️  No tests configured yet"
-          echo "✓ Basic validation passed"
+        run: python -m pytest test_mpegts_proxy.py -v
 
-      - name: Test aiohttp app startup
+      - name: Smoke test (startup + /health)
         run: |
-          # Start the app in background with timeout
-          timeout 10 python mpegts-proxy.py &  # Changed from hls-converter.py
+          python mpegts-proxy.py &
           APP_PID=$!
-          sleep 5
-          
-          # Test health endpoint
-          curl -f http://localhost:8000/health || exit 1
-          echo "✓ Health check passed"
-          
-          # Kill the app
-          kill $APP_PID 2>/dev/null || true
+          trap 'kill $APP_PID 2>/dev/null || true' EXIT
+          curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/health
 
   docker:
     needs: test
-    runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-
-    permissions:
-      contents: read
-      packages: write
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -102,18 +81,18 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
+            type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -129,19 +108,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKER_IMAGE }}
-          short-description: "MPEG-TS Stream Proxy - Convert DASH (MPD) to MPEG-TS streams on-the-fly"  # Updated description
+          short-description: "MPEG-TS Stream Proxy - converts HLS/DASH streams to MPEG-TS on the fly"
         continue-on-error: true
 
   security-scan:
     needs: docker
-    runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@master   # pin to a release tag or commit SHA
         with:
-          image-ref: ${{ env.DOCKER_IMAGE }}:latest
+          image-ref: ${{ env.DOCKER_IMAGE }}@${{ needs.docker.outputs.digest }}
           format: 'sarif'
           output: 'trivy-results.sarif'
         continue-on-error: true
@@ -157,33 +138,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, docker, security-scan]
     if: always()
-
     steps:
       - name: Workflow status
         run: |
-          echo "📊 Workflow Summary"
-          echo "===================="
-          echo "Test job:     ${{ needs.test.result }}"
-          echo "Docker job:   ${{ needs.docker.result }}"
-          echo "Security job: ${{ needs.security-scan.result }}"
-          echo ""
-          
-          if [[ "${{ needs.test.result }}" == "success" && "${{ needs.docker.result }}" == "success" ]]; then
-            echo "✅ Build completed successfully!"
-            echo "🐳 Image: ${{ env.DOCKER_IMAGE }}"
-            echo "🏷️  Tags: latest, ${{ github.sha }}"
+          echo "Test: ${{ needs.test.result }}  Docker: ${{ needs.docker.result }}  Security: ${{ needs.security-scan.result }}"
+          if [[ "${{ needs.test.result }}" == "success" && ( "${{ needs.docker.result }}" == "success" || "${{ needs.docker.result }}" == "skipped" ) ]]; then
+            echo "Build completed successfully"
           else
-            echo "❌ Build failed - check logs above"
+            echo "Build failed - check logs above"
             exit 1
           fi
-
-      # Optional: Slack/Discord notification
-      # - name: Send notification
-      #   if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-      #   uses: slackapi/slack-github-action@v1
-      #   with:
-      #     webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
-      #     payload: |
-      #       {
-      #         "text": "MPEG-TS Proxy build ${{ needs.docker.result }}: ${{ github.sha }}"
-      #       }
