@@ -153,7 +153,11 @@ RW_TIMEOUT = _env_int("MPEGTS_RW_TIMEOUT", 15)                # s; ffmpeg -rw_ti
 DASH_LIVE_WINDOW = _env_int("MPEGTS_DASH_LIVE_WINDOW", 0)
 JOIN_KEYFRAME_TIMEOUT = _env_int("MPEGTS_JOIN_KEYFRAME_TIMEOUT", 10)  # s a joining client waits for a video keyframe before settling for a PES start
 STREAM_READ_SIZE = _env_int("MPEGTS_READ_SIZE", 65800)        # 350 x 188-byte TS packets
-CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 64)   # chunks/client (~4 MB; must exceed one DASH segment burst. Overflow evicts to half capacity in ONE batch — see ClientBuffer.)
+# Per-client buffer BUDGET IN BYTES (not chunks: with -flush_packets 1 chunks are
+# only ~10 KB, so a chunk limit of 64 held about one second of a 5 Mbit/s
+# stream). 8 MiB is ~12 s at 5.4 Mbit/s and must outlast a DASH backlog burst.
+# Overflow evicts to half the budget in ONE batch — see ClientBuffer.
+CLIENT_QUEUE_BYTES = _env_int("MPEGTS_CLIENT_QUEUE_BYTES", 8 * 1024 * 1024)
 MAX_CLIENTS_PER_STREAM = _env_int("MPEGTS_MAX_CLIENTS_PER_STREAM", 50)
 SPAWN_WAIT_TIMEOUT = _env_int("MPEGTS_SPAWN_WAIT_TIMEOUT", 30)       # s; follower waits for leader
 PREFLIGHT_TIMEOUT = _env_int("MPEGTS_PREFLIGHT_TIMEOUT", 15)         # s; first-byte wait pre-headers (live). HLS/DASH probing is slow.
@@ -553,11 +557,10 @@ class ClientBuffer:
 
       * a late joiner is HELD until the buffer contains a video keyframe,
         then released starting with PAT+PMT and that keyframe. The wait is
-        bounded by TIME (JOIN_KEYFRAME_TIMEOUT), not by chunk count: how many
-        chunks a GOP spans depends on the bitrate (a 2 s GOP at 5 Mbit/s is
-        ~20 chunks) and live DASH sources burst, so a chunk limit releases
-        clients mid-GOP — no SPS/PPS, undecodable until the next keyframe.
-        After the timeout it settles for a PES start.
+        bounded by TIME (JOIN_KEYFRAME_TIMEOUT), not by queue size: how much
+        data a GOP spans depends on the bitrate and live DASH sources burst,
+        so a size limit releases clients mid-GOP — no SPS/PPS, undecodable
+        until the next keyframe. After the timeout it settles for a PES start.
       * while held, the buffer is capped by silently discarding the oldest
         chunks (nothing useful is lost: no client could start there, and it
         is not counted as a live-edge drop).
@@ -574,11 +577,12 @@ class ClientBuffer:
     byte stream itself.
     """
 
-    def __init__(self, max_chunks: int, stream: "StreamInfo | None" = None,
+    def __init__(self, max_bytes: int, stream: "StreamInfo | None" = None,
                  start_on_anchor: bool = False,
                  psi: PsiTracker | None = None) -> None:
         self._chunks: deque[bytes] = deque()
-        self._max_chunks = max(1, int(max_chunks))
+        self._max_bytes = max(4 * TS_PACKET_SIZE, int(max_bytes))
+        self._bytes = 0               # bytes currently queued
         self._stream = stream
         self._psi = psi
         self._armed = start_on_anchor  # late join: hold until the first anchor
@@ -594,9 +598,10 @@ class ClientBuffer:
 
     def push(self, chunk: bytes) -> None:
         self._chunks.append(chunk)
+        self._bytes += len(chunk)
         if self._armed:
             self._release_on_anchor()
-        elif len(self._chunks) > self._max_chunks:
+        elif self._bytes > self._max_bytes:
             self._trim_to_live_edge()
         if not self._armed:
             self._event.set()
@@ -619,6 +624,7 @@ class ClientBuffer:
         if timed_out:
             video_pid = None          # no keyframe in time: settle for a PES start
         found, chunks, n_bytes = _trim_head_to_anchor(self._chunks, video_pid)
+        self._bytes = sum(map(len, self._chunks))
         if found:
             if chunks or n_bytes:
                 self.join_skipped_chunks += chunks
@@ -630,28 +636,33 @@ class ClientBuffer:
                 prefix = self._psi.prefix() if self._psi is not None else b""
                 if prefix:
                     self._chunks.appendleft(prefix)   # tables first
+                    self._bytes += len(prefix)
             self._armed = False
         elif timed_out:
             self._armed = False       # not even a PES start: odd producer, flush what we have
         else:
             # Still waiting for a keyframe: bound the memory, silently.
-            while len(self._chunks) > self._max_chunks:
+            while self._bytes > self._max_bytes and len(self._chunks) > 1:
                 dropped = self._chunks.popleft()
+                self._bytes -= len(dropped)
                 self.join_skipped_chunks += 1
                 self.join_skipped_bytes += len(dropped)
 
     def _trim_to_live_edge(self) -> None:
         """One-batch eviction: down to half capacity, then re-anchor the
         head on the next keyframe (or PES start if none is buffered)."""
-        target = max(1, self._max_chunks // 2)
+        target = self._max_bytes // 2
         popped = popped_bytes = 0
-        while len(self._chunks) > target:
-            popped_bytes += len(self._chunks.popleft())
+        while self._bytes > target and len(self._chunks) > 1:
+            dropped = self._chunks.popleft()
+            self._bytes -= len(dropped)
+            popped_bytes += len(dropped)
             popped += 1
         video_pid = self._psi.video_pid if self._psi is not None else None
         found, anchored_chunks, anchored_bytes = _trim_head_to_anchor(self._chunks, video_pid)
         if not found and video_pid is not None:
             found, anchored_chunks, anchored_bytes = _trim_head_to_anchor(self._chunks, None)
+        self._bytes = sum(map(len, self._chunks))
         dropped_chunks = popped + anchored_chunks
         dropped_bytes = popped_bytes + anchored_bytes
         if dropped_chunks or dropped_bytes:
@@ -667,7 +678,9 @@ class ClientBuffer:
         asyncio.TimeoutError when nothing arrives within `timeout`."""
         while True:
             if self._chunks and not self._armed:
-                return self._chunks.popleft()
+                chunk = self._chunks.popleft()
+                self._bytes -= len(chunk)
+                return chunk
             if self._closed:
                 return None
             self._event.clear()
@@ -718,7 +731,7 @@ class StreamInfo:
         # start_on_anchor: the client is held until the buffer holds a video
         # keyframe, then starts on PAT+PMT+keyframe — for a fresh stream and
         # for a late joiner alike, never mid-GOP and never mid-PES.
-        buf = ClientBuffer(CLIENT_QUEUE_MAXSIZE, stream=self,
+        buf = ClientBuffer(CLIENT_QUEUE_BYTES, stream=self,
                            start_on_anchor=True, psi=self.psi)
         self.subscribers.add(buf)
         self.last_client_disconnect = None
