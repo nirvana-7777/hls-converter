@@ -40,20 +40,12 @@ one-time provider tokens are not resolved twice. The manifest is also read
 to pick the highest-bandwidth HLS variant / DASH representation, because
 the backend can only collapse variants on paths that rewrite the manifest.
 
-Live DASH starts near the live edge: ffmpeg's DASH demuxer begins at the
-oldest segment of the MPD's time-shift window (60 s for some providers), i.e.
-a minute behind live after a burst download. For live content the proxy
-therefore serves ffmpeg a copy of the MPD trimmed to the newest
-MPEGTS_DASH_LIVE_WINDOW seconds (default 8, 0 = off) from a loopback-only
-endpoint (/_internal/mpd/<secret>.mpd). ONLY the first MPD ffmpeg sees is
-trimmed; manifest reloads are answered with the untrimmed upstream MPD.
-Re-trimming on every reload proved harmful: the trimmed window slides in
-real time while ffmpeg's read position only advances at 1x, so any segment
-fetch jitter lets the window slide past the read position, at which point the
-demuxer jumps to the newest listed segment (a PTS discontinuity for every
-client). Serving the full window after the initial positioning keeps ~60 s of
-slack ahead of the read position and lets clients bank a real buffer, while
-still starting DASH_LIVE_WINDOW seconds behind live.
+Optional (MPEGTS_DASH_LIVE_WINDOW=<seconds>, default off): live DASH from the
+newest segments only. ffmpeg's DASH demuxer may begin at the oldest segment of
+the MPD's time-shift window (60 s for some providers); with the option set,
+the proxy serves ffmpeg a copy of the MPD trimmed to the newest N seconds from
+a loopback-only endpoint (/_internal/mpd/<secret>.mpd), re-trimmed on every
+manifest reload.
 
 The generic `/stream?url=...` endpoint (any URL, optionally pipe://) is OFF
 unless MPEGTS_ALLOW_GENERIC_URL=1.
@@ -150,24 +142,15 @@ WATCHDOG_INTERVAL = 5                                         # s between source
 STALL_TIMEOUT = _env_int("MPEGTS_STALL_TIMEOUT", 20)          # s without a source byte -> kill (flowing stream)
 STARTUP_TIMEOUT = _env_int("MPEGTS_STARTUP_TIMEOUT", 45)      # s without the FIRST byte -> kill (probing is slow)
 RW_TIMEOUT = _env_int("MPEGTS_RW_TIMEOUT", 15)                # s; ffmpeg -rw_timeout: prefer dying over hanging
-# Live DASH: how many seconds behind the live edge a NEW stream starts.
-# ffmpeg's DASH demuxer has no start-position option and begins at the OLDEST
-# segment of the MPD's time-shift window (60 s on e.g. magenta2): playback
-# starts a minute behind live after a burst download that can also skip
-# segments. The proxy therefore hands ffmpeg a copy of the FIRST MPD trimmed
-# to the newest segments; reloads get the untrimmed manifest (re-trimming on
-# every reload slides the window out from under a 1x read position and turns
-# fetch jitter into segment skips).
-# 0 disables the trimming (ffmpeg gets the backend/upstream MPD directly).
-DASH_LIVE_WINDOW = _env_int("MPEGTS_DASH_LIVE_WINDOW", 8)
-# Response cache for the internal MPD endpoint. ffmpeg's dashdec polls the
-# manifest at a very high rate while it waits at the live edge (it pre-guesses
-# the next segment number, gets a 404 and retries; measured locally: ~1000
-# manifest requests per second, each of which this proxy would otherwise
-# forward upstream). A short TTL collapses that to ~1 upstream fetch per
-# second; dashdec tolerates a stale manifest of this magnitude without any
-# visible effect on segment pickup.
-MPD_CACHE_SECONDS = _env_int("MPEGTS_MPD_CACHE_SECONDS", 1)
+# Live DASH: how many seconds behind the live edge ffmpeg may start. ffmpeg's
+# DASH demuxer has no start-position option and begins at the OLDEST segment of
+# the MPD's time-shift window (60 s on e.g. magenta2): playback starts a minute
+# behind live after a burst download that can also skip segments. The proxy
+# therefore hands ffmpeg a copy of the MPD trimmed to the newest segments.
+# OFF by default (0 = ffmpeg gets the backend/upstream MPD directly): on a real
+# magenta2 stream it made no visible difference to the start-up hiccups, and
+# its effect on latency is unmeasured. Opt in with e.g. 8 (seconds).
+DASH_LIVE_WINDOW = _env_int("MPEGTS_DASH_LIVE_WINDOW", 0)
 JOIN_KEYFRAME_TIMEOUT = _env_int("MPEGTS_JOIN_KEYFRAME_TIMEOUT", 10)  # s a joining client waits for a video keyframe before settling for a PES start
 STREAM_READ_SIZE = _env_int("MPEGTS_READ_SIZE", 65800)        # 350 x 188-byte TS packets
 CLIENT_QUEUE_MAXSIZE = _env_int("MPEGTS_CLIENT_QUEUE_MAXSIZE", 64)   # chunks/client (~4 MB; must exceed one DASH segment burst. Overflow evicts to half capacity in ONE batch — see ClientBuffer.)
@@ -787,14 +770,7 @@ def _ffmpeg_cmd(source: str, name: str, *, map_args: list[str] | None = None,
         "-probesize", "5M",
         "-analyzeduration", "2M",
         "-reconnect", "1",
-        # NO -reconnect_streamed: on origins without Range support a mid-body
-        # reconnect restarts the transfer from byte 0 while ffmpeg believes
-        # it resumed at the old offset ("Will reconnect at N" + a 200 answer)
-        # — the demuxer is then fed duplicated, offset-shifted data, which
-        # reaches clients as backwards-jumping timestamps. Without the flag a
-        # streamed response that breaks simply errors out, the watchdog
-        # kills the source and the next request respawns cleanly. -reconnect
-        # alone still resumes properly on Range-capable origins.
+        "-reconnect_streamed", "1",
         "-reconnect_delay_max", "2",
         # A stalled TCP connection that never errors out would hang ffmpeg
         # forever while clients see a "running" stream without data. A read
@@ -997,24 +973,6 @@ def _trim_dash_live(text: str, source_url: str, window_seconds: float) -> str:
 
 # ===== Stream manager =====
 
-@dataclass(eq=False)
-class MpdSource:
-    """Registration of a live stream's trimmed-MPD endpoint (see
-    _resolve_source / internal_mpd_handler). `positioned` flips to True once
-    the first (trimmed) MPD has been served to this stream's ffmpeg; manifest
-    reloads are then answered with the untrimmed upstream MPD so the sliding
-    time-shift window can never slide past ffmpeg's read position.
-
-    `cached_text`/`cached_at` form a tiny response cache: dashdec polls the
-    manifest extremely fast at the live edge and the upstream should not see
-    that (see MPD_CACHE_SECONDS)."""
-
-    url: str
-    positioned: bool = False
-    cached_text: str | None = None
-    cached_at: float = 0.0
-
-
 class StreamManager:
     def __init__(self, max_streams: int = MAX_STREAMS, max_stream_age: int = MAX_STREAM_AGE):
         self.streams: dict[str, StreamInfo] = {}      # key -> shared (live) StreamInfo
@@ -1025,7 +983,7 @@ class StreamManager:
         self._watchdog_task: asyncio.Task | None = None
         self._spawn_lock = asyncio.Lock()
         self._spawning: dict[str, asyncio.Future] = {}  # key -> future resolved by the leader
-        self.mpd_sources: dict[str, MpdSource] = {}    # token -> original live MPD + one-time-trim state
+        self.mpd_sources: dict[str, str] = {}          # token -> original live MPD URL (trimmed-MPD endpoint)
         self._ondemand_slots = 0                       # reserved before the (slow) backend lookup
         # Cumulative counters (monotonic — safe for Prometheus rate()).
         self._total_bytes_read = 0
@@ -1709,8 +1667,7 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str) -> str | None:
 
 
 async def _resolve_source(session: aiohttp.ClientSession, backend_url: str, *,
-                          live: bool = False,
-                          mpd_sources: dict[str, MpdSource] | None = None,
+                          live: bool = False, mpd_sources: dict[str, str] | None = None,
                           internal_base: str | None = None) -> Resolved:
     """Ask the backend once, WITHOUT following redirects.
 
@@ -1761,7 +1718,7 @@ async def _resolve_source(session: aiohttp.ClientSession, backend_url: str, *,
     if (kind == "dash" and live and DASH_LIVE_WINDOW > 0 and mpd_sources is not None
             and internal_base and 'type="dynamic"' in (text or "")[:8192].replace("'", '"')):
         mpd_token = secrets.token_urlsafe(16)
-        mpd_sources[mpd_token] = MpdSource(url=source)
+        mpd_sources[mpd_token] = source
         source = f"{internal_base}{INTERNAL_MPD_PREFIX}{mpd_token}.mpd"
     return Resolved(source=source, map_args=map_args, kind=kind, mpd_token=mpd_token)
 
@@ -2109,54 +2066,26 @@ def _is_local_peer(request: web.Request) -> bool:
 
 
 async def internal_mpd_handler(request: web.Request) -> web.Response:
-    """GET /_internal/mpd/<token>.mpd — the live MPD for one stream's ffmpeg.
-
-    The FIRST answer is the MPD trimmed to its newest DASH_LIVE_WINDOW
-    seconds: it positions ffmpeg near the live edge instead of at the oldest
-    segment of the time-shift window. Every subsequent answer (manifest
-    reload) is the UNTRIMMED upstream MPD: ffmpeg keeps its read position
-    across reloads, and re-trimming would slide the window forward in real
-    time while the read position advances at only 1x — one slow segment fetch
-    and the window has slid past the position, forcing the demuxer to jump to
-    the newest listed segment (a PTS discontinuity fanned out to every
-    client). With the full window listed, ffmpeg has ~timeShiftBufferDepth of
-    slack and clients can bank a real buffer.
-
-    Only this proxy's own ffmpeg may call this endpoint: the token is a random
-    secret handed out by _resolve_source and the peer must be local. Responses
-    are cached for MPD_CACHE_SECONDS: dashdec polls the manifest at a very
-    high rate while waiting at the live edge, and the upstream must not see
-    that (measured locally: ~1000 requests/second without the cache)."""
+    """GET /_internal/mpd/<token>.mpd — the live MPD, trimmed to its newest
+    segments. Only this proxy's own ffmpeg may call it: the token is a random
+    secret handed out by _resolve_source and the peer must be local."""
     mgr: StreamManager = request.app["stream_manager"]
-    entry = mgr.mpd_sources.get(request.match_info["token"])
-    if entry is None or not _is_local_peer(request):
+    source = mgr.mpd_sources.get(request.match_info["token"])
+    if source is None or not _is_local_peer(request):
         return web.Response(status=404)
     session: aiohttp.ClientSession = request.app["client_session"]
-
-    text: str | None = None
-    now = time.monotonic()
-    if entry.cached_text is not None and (now - entry.cached_at) < MPD_CACHE_SECONDS:
-        text = entry.cached_text
-    else:
-        try:
-            async with session.get(entry.url, max_redirects=3) as r:
-                if r.status != 200:
-                    return web.Response(status=502)
-                final_url = str(r.url)
-                text = (await _read_capped(r)).decode("utf-8", "replace")
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"trimmed MPD: source fetch failed: {e}")
-            return web.Response(status=502)
-        entry.cached_text, entry.cached_at = text, now
-        if not entry.positioned:
-            # First fetch for this stream's ffmpeg: trim the response once.
-            # The cache deliberately keeps the RAW body — reloads must see
-            # the untrimmed manifest.
-            entry.positioned = True   # set before trimming: on a trim error we fall back to untrimmed, consistently
-            try:
-                text = _trim_dash_live(text, final_url, DASH_LIVE_WINDOW)
-            except Exception as e:             # never break playback over the optimisation
-                logger.warning(f"trimmed MPD: falling back to the untrimmed MPD ({e})")
+    try:
+        async with session.get(source, max_redirects=3) as r:
+            if r.status != 200:
+                return web.Response(status=502)
+            text = (await _read_capped(r)).decode("utf-8", "replace")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"trimmed MPD: source fetch failed: {e}")
+        return web.Response(status=502)
+    try:
+        text = _trim_dash_live(text, str(r.url), DASH_LIVE_WINDOW)
+    except Exception as e:                 # never break playback over the optimisation
+        logger.warning(f"trimmed MPD: falling back to the untrimmed MPD ({e})")
     return web.Response(text=text, content_type="application/dash+xml")
 
 
