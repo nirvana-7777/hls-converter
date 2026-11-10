@@ -850,9 +850,16 @@ def _hls_best_program(text: str) -> int | None:
 
 
 def _dash_map_args(text: str) -> list[str] | None:
-    """-map arguments selecting the highest-bandwidth video representation
-    and the best audio representation per language; None when the MPD has
-    nothing to choose between (or cannot be parsed)."""
+    """-map arguments selecting the highest-bandwidth VIDEO representation;
+    None when the MPD has nothing to choose between (or cannot be parsed).
+
+    Audio is deliberately NOT filtered: every audio track is kept
+    (-map 0:a?), like the backend's own ffmpeg variant does. An earlier
+    version also picked one audio representation per language through the
+    variant_bitrate tag; on a real live stream its output carried several
+    times the audio data of a plain '-map 0:a?' run with otherwise identical
+    options, and for the usual case (several languages/codecs) it selected the
+    same streams anyway."""
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
@@ -862,7 +869,6 @@ def _dash_map_args(text: str) -> list[str] | None:
         return tag.rsplit("}", 1)[-1]
 
     video: list[int] = []
-    audio: dict[str, list[int]] = {}
     for aset in root.iter():
         if local(aset.tag) != "AdaptationSet":
             continue
@@ -872,29 +878,15 @@ def _dash_map_args(text: str) -> list[str] | None:
             ctype = (aset.get("contentType") or rep.get("contentType") or "").lower()
             if not ctype:
                 ctype = (aset.get("mimeType") or rep.get("mimeType") or "").lower().split("/")[0]
+            if ctype != "video":
+                continue
             try:
-                bw = int(rep.get("bandwidth", "0"))
+                video.append(int(rep.get("bandwidth", "0")))
             except ValueError:
                 continue
-            if ctype == "video":
-                video.append(bw)
-            elif ctype == "audio":
-                audio.setdefault(aset.get("lang") or rep.get("lang") or "", []).append(bw)
-
-    args: list[str] = []
     if len(set(video)) > 1:
-        args += ["-map", f"0:v:m:variant_bitrate:{max(video)}?"]
-    elif video:
-        args += ["-map", "0:v:0?"]
-    if audio and any(len(set(v)) > 1 for v in audio.values()):
-        for bw in sorted({max(v) for v in audio.values()}):
-            args += ["-map", f"0:a:m:variant_bitrate:{bw}?"]
-    else:
-        args += ["-map", "0:a?"]
-    if not video and not audio:
-        return None
-    # Only worth deviating from the default when something was really chosen.
-    return args if any("variant_bitrate" in a for a in args) else None
+        return ["-map", f"0:v:m:variant_bitrate:{max(video)}?", "-map", "0:a?"]
+    return None
 
 
 def _plan_streams(text: str) -> tuple[str, list[str]]:
