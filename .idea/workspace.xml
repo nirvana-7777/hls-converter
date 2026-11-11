@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="remove trimming">
+    <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="rollback">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/mpegts-proxy.py" beforeDir="false" afterPath="$PROJECT_DIR$/mpegts-proxy.py" afterDir="false" />
     </list>
@@ -73,14 +73,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1770032976347</updated>
-    </task>
-    <task id="LOCAL-00003" summary="Initial">
-      <option name="closed" value="true" />
-      <created>1770039513775</created>
-      <option name="number" value="00003" />
-      <option name="presentableId" value="LOCAL-00003" />
-      <option name="project" value="LOCAL" />
-      <updated>1770039513775</updated>
     </task>
     <task id="LOCAL-00004" summary="Initial">
       <option name="closed" value="true" />
@@ -466,7 +458,15 @@
       <option name="project" value="LOCAL" />
       <updated>1794391751310</updated>
     </task>
-    <option name="localTasksCounter" value="52" />
+    <task id="LOCAL-00052" summary="rollback">
+      <option name="closed" value="true" />
+      <created>1794394113321</created>
+      <option name="number" value="00052" />
+      <option name="presentableId" value="LOCAL-00052" />
+      <option name="project" value="LOCAL" />
+      <updated>1794394113321</updated>
+    </task>
+    <option name="localTasksCounter" value="53" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -487,6 +487,7 @@
     <MESSAGE value="next try" />
     <MESSAGE value="bump debian" />
     <MESSAGE value="remove trimming" />
-    <option name="LAST_COMMIT_MESSAGE" value="remove trimming" />
+    <MESSAGE value="rollback" />
+    <option name="LAST_COMMIT_MESSAGE" value="rollback" />
   </component>
 </project>
