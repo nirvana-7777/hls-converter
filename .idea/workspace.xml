@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="71c79eaf-3a1b-44fd-a8da-ac9ad823346b" name="Changes" comment="rollback">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/mpegts-proxy.py" beforeDir="false" afterPath="$PROJECT_DIR$/mpegts-proxy.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -73,14 +72,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1770032976347</updated>
-    </task>
-    <task id="LOCAL-00004" summary="Initial">
-      <option name="closed" value="true" />
-      <created>1770040057449</created>
-      <option name="number" value="00004" />
-      <option name="presentableId" value="LOCAL-00004" />
-      <option name="project" value="LOCAL" />
-      <updated>1770040057449</updated>
     </task>
     <task id="LOCAL-00005" summary="Initial">
       <option name="closed" value="true" />
@@ -466,7 +457,15 @@
       <option name="project" value="LOCAL" />
       <updated>1794394113321</updated>
     </task>
-    <option name="localTasksCounter" value="53" />
+    <task id="LOCAL-00053" summary="rollback">
+      <option name="closed" value="true" />
+      <created>1794394683975</created>
+      <option name="number" value="00053" />
+      <option name="presentableId" value="LOCAL-00053" />
+      <option name="project" value="LOCAL" />
+      <updated>1794394683975</updated>
+    </task>
+    <option name="localTasksCounter" value="54" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">

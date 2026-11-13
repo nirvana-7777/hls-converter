@@ -19,6 +19,8 @@ video quality — whatever the caller passes. Accepted query parameters:
   country, drm_variant, no_proxy        passed through to the backend
   start_time, end_time, epg_id          channel catchup, passed through
   start=<seconds>                       on-demand only: seek via ffmpeg -ss
+  fast=0                                on-demand only: no parallel segment
+                                        fetching, ffmpeg fetches (debugging)
   name=<text>                           MPEG-TS service_name (default
                                         "<provider>/<id>")
 
@@ -31,6 +33,22 @@ Two playback modes, chosen by content type (X-TS-Mode response header):
              backpressure: nothing is ever dropped, ffmpeg simply blocks
              while the client is slower. TS has no seeking, so players get
              play-through only (use ?start= to begin later).
+
+Static manifests (finished HLS playlists / DASH type="static", i.e. nearly
+all VOD, recordings and past catchup) are downloaded as fast as origin and
+client allow: the proxy fetches the segments itself, MPEGTS_PARALLEL_SEGMENTS
+at a time per track over keep-alive connections, and pipes them in order
+into ffmpeg, which only remuxes. ffmpeg's own demuxers fetch one segment
+after the other. Backpressure still holds end to end, so a slow client only
+ever holds a few segments per track in memory. Dynamic manifests, and
+anything unusual in a static one (several periods, discontinuities, byte
+ranges, HLS encryption, ?start=, MPEGTS_FFMPEG_EXTRA_IN), keep the plain
+ffmpeg path, as does a parallel attempt that yields no first byte
+(X-TS-Fetch: parallel | ffmpeg tells which one served a request). A segment
+that cannot be fetched mid-download aborts the connection rather than
+ending the body cleanly, so a downloader sees an incomplete file.
+  MPEGTS_PARALLEL_SEGMENTS (4; 0 = off), MPEGTS_SEGMENT_TIMEOUT (60 s),
+  MPEGTS_SEGMENT_RETRIES (3), MPEGTS_SEGMENT_MAX_BYTES (64 MiB).
 
 Before spawning ffmpeg the proxy asks the backend once (no redirects
 followed). Errors come back as JSON with the backend's message and a hint
@@ -151,6 +169,15 @@ BACKEND_TIMEOUT = _env_int("MPEGTS_BACKEND_TIMEOUT", 10)             # s; backen
 ONDEMAND_WRITE_TIMEOUT = _env_int("MPEGTS_ONDEMAND_WRITE_TIMEOUT", 900)  # s a client may block a write (a paused player is normal; a dead one is not)
 RETRY_AFTER = _env_int("MPEGTS_RETRY_AFTER", 5)                      # s; Retry-After on capacity 503s
 MANIFEST_MAX_BYTES = 2 * 1024 * 1024                                 # manifests are small; never buffer more
+# Static manifests (VOD, recordings, finished catchup): the proxy fetches the
+# segments itself, PARALLEL_SEGMENTS at a time over keep-alive connections, and
+# pipes them into ffmpeg (see "Static manifests" below). 0 = always let ffmpeg
+# fetch (sequentially, one segment after the other).
+PARALLEL_SEGMENTS = max(0, _env_int("MPEGTS_PARALLEL_SEGMENTS", 4))
+SEGMENT_TIMEOUT = _env_int("MPEGTS_SEGMENT_TIMEOUT", 60)             # s, whole request incl. body
+SEGMENT_RETRIES = max(0, _env_int("MPEGTS_SEGMENT_RETRIES", 3))      # extra attempts per segment
+SEGMENT_MAX_BYTES = _env_int("MPEGTS_SEGMENT_MAX_BYTES", 64 * 1024 * 1024)   # one segment, held in memory
+MAX_SEGMENTS = 200_000                                               # sanity cap per track
 ALLOW_PRIVATE_URLS = _env_bool("MPEGTS_ALLOW_PRIVATE_URLS", False)
 ALLOW_PIPE = _env_bool("MPEGTS_ALLOW_PIPE", False)
 ALLOW_GENERIC_URL = _env_bool("MPEGTS_ALLOW_GENERIC_URL", False)     # the open /stream?url=... endpoint
@@ -701,9 +728,22 @@ class StreamInfo:
     dropped_bytes: int = 0                     # bytes skipped by the same trims
     drop_sink: "callable | None" = None        # set by StreamManager: global-counter hook
     stall_events: int = 0                      # informational
+    fetch_mode: str = "ffmpeg"                 # who fetches the segments: "ffmpeg" | "parallel" (X-TS-Fetch)
+    feeders: list[asyncio.Task] = field(default_factory=list)   # parallel mode: one segment feeder per track
+    feed_error: str | None = None              # parallel mode: why a feeder gave up
 
     def __post_init__(self) -> None:
         self._last_drop_log = 0.0
+
+    def fail_feed(self, message: str) -> None:
+        """A segment feeder gave up. Stop ffmpeg right away: the other tracks
+        would otherwise keep flowing into a stream that is missing one of
+        its parts. The handler notices feed_error and aborts the response."""
+        if self.feed_error is None:
+            self.feed_error = message
+            if self.process.returncode is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
 
     @property
     def client_count(self) -> int:
@@ -750,36 +790,71 @@ class StreamInfo:
 DEFAULT_MAP = ["-map", "0:v:0?", "-map", "0:a?"]
 
 
+@dataclass
+class PipeInput:
+    """One ffmpeg input fed by the proxy through an inherited pipe fd."""
+    fd: int
+    fmt: str | None            # ffmpeg -f for the input; None = let ffmpeg probe
+
+
 def _ffmpeg_cmd(source: str, name: str, *, map_args: list[str] | None = None,
-                start: float | None = None, generic: bool = False) -> list[str]:
+                start: float | None = None, generic: bool = False,
+                pipes: list[PipeInput] | None = None,
+                low_latency: bool = True) -> list[str]:
+    """ffmpeg remux command.
+
+    pipes: the inputs are pipe:<fd> (static manifests, segments fetched by
+      this proxy) instead of `source`; the HTTP-only input options
+      (-reconnect, -rw_timeout, -user_agent, protocol whitelist) are left out
+      because ffmpeg rejects options no protocol consumed.
+    low_latency: flush every packet (live fan-out). On-demand playback has no
+      latency to protect, and one write() per packet is what limits its
+      throughput, so it passes False and lets the muxer batch its writes."""
     cmd: list[str] = [
         "ffmpeg",
         "-nostdin",                # never touch our stdin
         "-loglevel", FFMPEG_LOGLEVEL,
     ]
-    if USER_AGENT:
-        cmd += ["-user_agent", USER_AGENT]
+    if pipes:
+        if len(pipes) > 1:
+            # Separate audio/video inputs: keep their original relative
+            # timestamps (otherwise each input is re-based to its own start);
+            # -avoid_negative_ts below then shifts them all together.
+            cmd += ["-copyts"]
+        for p in pipes:
+            cmd += [
+                "-fflags", "+genpts+igndts+discardcorrupt",
+                "-probesize", "5M",
+                "-analyzeduration", "2M",
+                "-thread_queue_size", "2048",
+            ]
+            if p.fmt:
+                cmd += ["-f", p.fmt]
+            cmd += ["-i", f"pipe:{p.fd}"]
+    else:
+        if USER_AGENT:
+            cmd += ["-user_agent", USER_AGENT]
+        cmd += [
+            "-protocol_whitelist", PROTOCOLS_GENERIC if generic else PROTOCOLS_BACKEND,
+            "-fflags", "+genpts+igndts+discardcorrupt",
+            "-probesize", "5M",
+            "-analyzeduration", "2M",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "2",
+            # A stalled TCP connection that never errors out would hang ffmpeg
+            # forever while clients see a "running" stream without data. A read
+            # timeout makes ffmpeg exit instead; the watchdog covers the rest.
+            "-rw_timeout", str(RW_TIMEOUT * 1_000_000),
+            "-thread_queue_size", "2048",
+            # Escape hatch (MPEGTS_FFMPEG_EXTRA_IN): injected verbatim before -i,
+            # e.g. -headers "Authorization: Bearer ..." for token-gated origins.
+            *FFMPEG_EXTRA_IN,
+        ]
+        if start:
+            cmd += ["-ss", f"{start:g}"]       # input seek (on-demand only)
+        cmd += ["-i", source]
     cmd += [
-        "-protocol_whitelist", PROTOCOLS_GENERIC if generic else PROTOCOLS_BACKEND,
-        "-fflags", "+genpts+igndts+discardcorrupt",
-        "-probesize", "5M",
-        "-analyzeduration", "2M",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "2",
-        # A stalled TCP connection that never errors out would hang ffmpeg
-        # forever while clients see a "running" stream without data. A read
-        # timeout makes ffmpeg exit instead; the watchdog covers the rest.
-        "-rw_timeout", str(RW_TIMEOUT * 1_000_000),
-        "-thread_queue_size", "2048",
-        # Escape hatch (MPEGTS_FFMPEG_EXTRA_IN): injected verbatim before -i,
-        # e.g. -headers "Authorization: Bearer ..." for token-gated origins.
-        *FFMPEG_EXTRA_IN,
-    ]
-    if start:
-        cmd += ["-ss", f"{start:g}"]       # input seek (on-demand only)
-    cmd += [
-        "-i", source,
         *(map_args or DEFAULT_MAP),
         "-c", "copy",
         "-avoid_negative_ts", "make_zero",
@@ -790,7 +865,7 @@ def _ffmpeg_cmd(source: str, name: str, *, map_args: list[str] | None = None,
         "-mpegts_flags", "resend_headers",
         "-mpegts_copyts", "1",
         "-metadata", f"service_name={name}",
-        "-flush_packets", "1",
+        "-flush_packets", "1" if low_latency else "0",
         # Escape hatch (MPEGTS_FFMPEG_EXTRA_OUT): injected verbatim before the
         # output target, e.g. -mpegts_flags latm (HE-AAC sources), -an.
         *FFMPEG_EXTRA_OUT,
@@ -1006,10 +1081,12 @@ class StreamManager:
 
     # ----- process helpers -----
 
-    async def _start_process(self, cmd: list[str]) -> asyncio.subprocess.Process | None:
+    async def _start_process(self, cmd: list[str],
+                             pass_fds: tuple[int, ...] = ()) -> asyncio.subprocess.Process | None:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                pass_fds=pass_fds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1298,8 +1375,75 @@ class StreamManager:
         logger.info(f"on-demand {info.stream_id} started ({loggable_url(key)}, {kind})")
         return info
 
+    async def start_ondemand_fast(self, key: str, name: str, plan: "StaticPlan",
+                                  session: aiohttp.ClientSession) -> StreamInfo | None:
+        """On-demand playback of a static manifest: this proxy downloads the
+        segments (several at a time) and writes them into one pipe per track;
+        ffmpeg only remuxes. Returns None when ffmpeg cannot be started."""
+        read_fds: list[int] = []
+        write_fds: list[int] = []
+        proc = None
+        try:
+            for _ in plan.tracks:
+                r, w = os.pipe()
+                read_fds.append(r)
+                write_fds.append(w)
+            maps: list[str] = []
+            for i, track in enumerate(plan.tracks):
+                maps += track.maps(i)
+            cmd = _ffmpeg_cmd(
+                "", name, map_args=maps, low_latency=False,
+                pipes=[PipeInput(fd, t.fmt) for fd, t in zip(read_fds, plan.tracks)],
+            )
+            proc = await self._start_process(cmd, pass_fds=tuple(read_fds))
+        finally:
+            for fd in read_fds:                 # the child owns its copies now
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        if proc is None:
+            for fd in write_fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            return None
+
+        self._ondemand_seq += 1
+        self._total_ondemand_created += 1
+        info = StreamInfo(
+            stream_id=f"{self._stream_id_from_key(key)}-{self._ondemand_seq}",
+            url=key, display_name=name, process=proc,
+            mode="ondemand", source_kind=plan.kind, fetch_mode="parallel",
+        )
+        info.stderr_task = asyncio.create_task(self._drain_stderr(info))
+        self.ondemand.add(info)
+        try:
+            for i, (track, wfd) in enumerate(zip(plan.tracks, write_fds)):
+                writer = await _open_write_pipe(wfd)
+                write_fds[i] = -1               # now owned by the writer
+                info.feeders.append(asyncio.create_task(_feed_track(session, track, writer, info)))
+        except BaseException as e:  # CancelledError too: the handler's
+            # `info` is still unassigned there, so nobody else will clean up.
+            for fd in write_fds:
+                if fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            info.fail_feed(f"could not open pipes: {e}")
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(info.process.pid), signal.SIGKILL)
+            self.ondemand.discard(info)
+            raise
+        logger.info(
+            f"on-demand {info.stream_id} started ({loggable_url(key)}, {plan.kind}, "
+            f"{len(plan.tracks)} track(s), {PARALLEL_SEGMENTS} segments in flight each)"
+        )
+        return info
+
     async def finish_ondemand(self, info: StreamInfo) -> None:
         self.ondemand.discard(info)
+        for t in info.feeders:
+            t.cancel()
+        for t in info.feeders:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(t, timeout=1.0)
         await self._kill_process(info.process)
         t = info.stderr_task
         if t is not None and not t.done():
@@ -1425,6 +1569,8 @@ class Resolved:
     source: str            # what ffmpeg should open
     map_args: list[str]    # which streams to map (see _plan_streams)
     kind: str              # hls | dash | unknown
+    text: str | None = None    # the manifest as fetched (None: unreadable)
+    base_url: str = ""         # where relative URIs in `text` resolve against
 
 
 class BackendError(Exception):
@@ -1617,7 +1763,453 @@ async def _resolve_source(session: aiohttp.ClientSession, backend_url: str) -> R
         source = backend_url
 
     kind, map_args = _plan_streams(text or "")
-    return Resolved(source=source, map_args=map_args, kind=kind)
+    return Resolved(source=source, map_args=map_args, kind=kind, text=text, base_url=source)
+
+
+# ===== Static manifests: parallel segment fetching =====
+#
+# A finished manifest (VOD, recording, past catchup: DASH type="static", HLS
+# with #EXT-X-ENDLIST) lists every segment up front, so nothing forces them to
+# be downloaded one after the other. ffmpeg's demuxers do exactly that, one
+# short-lived connection per segment, and a slow origin (backend + media-proxy
+# decrypt) makes the whole download latency-bound.
+#
+# The fast path therefore reads the manifest itself and keeps up to
+# PARALLEL_SEGMENTS requests in flight per track over keep-alive connections.
+# The segments are written, in order, into one pipe per track; ffmpeg
+# (-c copy) remuxes them to TS. Backpressure runs the whole way back:
+#   client socket -> ffmpeg stdout -> ffmpeg pipe reads -> pipe write -> window
+# so the download is as fast as origin AND client allow, and a slow client
+# only ever holds PARALLEL_SEGMENTS segments per track in memory.
+#
+# Only the clean, common cases take this path. Anything unusual (live/dynamic,
+# several periods, discontinuities, byte ranges, HLS encryption, unreadable
+# manifests, ...) returns None from the planner and ffmpeg fetches the stream
+# the way it always did.
+
+@dataclass
+class TrackPlan:
+    kind: str                  # "muxed" (audio+video) | "video" | "audio"
+    fmt: str | None            # ffmpeg input format: "mp4" | "mpegts" | None (probe)
+    init: str | None           # initialization segment, written first
+    segments: list[str]
+    label: str = ""
+
+    def maps(self, idx: int) -> list[str]:
+        if self.kind == "video":
+            return ["-map", f"{idx}:v:0?"]
+        if self.kind == "audio":
+            return ["-map", f"{idx}:a?"]
+        return ["-map", f"{idx}:v:0?", "-map", f"{idx}:a?"]
+
+    def urls(self) -> list[str]:
+        return ([self.init] if self.init else []) + self.segments
+
+
+@dataclass
+class StaticPlan:
+    kind: str                  # hls | dash
+    tracks: list[TrackPlan]
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    p = urlparse(url)
+    return (p.scheme, p.hostname, p.port)
+
+
+# -- HLS ------------------------------------------------------------------------
+
+_HLS_ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+
+
+def _hls_attrs(line: str) -> dict[str, str]:
+    body = line.split(":", 1)[1] if ":" in line else ""
+    return {k: v.strip().strip('"') for k, v in _HLS_ATTR_RE.findall(body)}
+
+
+def _hls_parse_media(text: str, base: str) -> tuple[str | None, str | None, list[str]] | None:
+    """(init, ffmpeg input format, segment URLs) of a FINISHED, clean media
+    playlist; None when the fast path does not apply."""
+    init: str | None = None
+    segs: list[str] = []
+    ended = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            tag = line.split(":", 1)[0]
+            if tag == "#EXT-X-ENDLIST":
+                ended = True
+            elif tag == "#EXT-X-KEY":
+                if _hls_attrs(line).get("METHOD", "NONE") != "NONE":
+                    return None                    # AES-128 / SAMPLE-AES: ffmpeg decrypts
+            elif tag == "#EXT-X-MAP":
+                a = _hls_attrs(line)
+                if init is not None or "BYTERANGE" in a or "URI" not in a:
+                    return None
+                init = urljoin(base, a["URI"])
+            elif tag in ("#EXT-X-BYTERANGE", "#EXT-X-DISCONTINUITY", "#EXT-X-GAP",
+                         "#EXT-X-I-FRAMES-ONLY", "#EXT-X-DEFINE"):
+                return None                        # timestamp resets / sub-ranges: ffmpeg's job
+            continue
+        segs.append(urljoin(base, line))
+        if len(segs) > MAX_SEGMENTS:
+            return None
+    if not ended or not segs:
+        return None
+    if init:
+        fmt: str | None = "mp4"
+    elif urlparse(segs[0]).path.lower().endswith(".ts"):
+        fmt = "mpegts"
+    else:
+        fmt = None
+    return init, fmt, segs
+
+
+async def _plan_hls(session: aiohttp.ClientSession, text: str, base: str) -> StaticPlan | None:
+    if "#EXT-X-STREAM-INF" not in text:             # a media playlist was served directly
+        media = _hls_parse_media(text, base)
+        if media is None:
+            return None
+        init, fmt, segs = media
+        return StaticPlan("hls", [TrackPlan("muxed", fmt, init, segs, "media")])
+
+    variants: list[tuple[int, str, str | None]] = []
+    audio: dict[str, list[dict[str, str]]] = {}
+    pending: dict[str, str] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            pending = _hls_attrs(line)
+        elif line.startswith("#EXT-X-MEDIA:"):
+            a = _hls_attrs(line)
+            if a.get("TYPE") == "AUDIO":
+                audio.setdefault(a.get("GROUP-ID", ""), []).append(a)
+        elif pending is not None and line and not line.startswith("#"):
+            try:
+                bw = int(pending.get("BANDWIDTH", "0") or 0)
+            except ValueError:
+                bw = 0
+            variants.append((bw, urljoin(base, line), pending.get("AUDIO")))
+            pending = None
+    if not variants:
+        return None
+    _, v_url, group = max(variants, key=lambda v: v[0])      # first of equals, like _plan_streams
+    renditions = audio.get(group, []) if group else []
+    with_uri = [a for a in renditions if a.get("URI")]
+    if with_uri and len(with_uri) != len(renditions):
+        return None                                           # half muxed, half separate: ffmpeg's job
+    with_uri.sort(key=lambda a: a.get("DEFAULT") != "YES")   # stable: default language first
+
+    urls = [v_url] + [urljoin(base, a["URI"]) for a in with_uri]
+    texts = await asyncio.gather(*(_fetch_text(session, u) for u in urls))
+    tracks: list[TrackPlan] = []
+    for i, (u, t) in enumerate(zip(urls, texts)):
+        if t is None:
+            return None
+        media = _hls_parse_media(t, u)
+        if media is None:
+            return None
+        init, fmt, segs = media
+        if i == 0:
+            tracks.append(TrackPlan("video" if with_uri else "muxed", fmt, init, segs, "video"))
+        else:
+            tracks.append(TrackPlan("audio", fmt, init, segs, with_uri[i - 1].get("NAME", "audio")))
+    return StaticPlan("hls", tracks)
+
+
+# -- DASH -----------------------------------------------------------------------
+
+_ISO_DURATION_RE = re.compile(
+    r"^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$")
+_DASH_TEMPLATE_RE = re.compile(r"\$(RepresentationID|Number|Bandwidth|Time)(?:%0(\d+)d)?\$|\$\$")
+
+
+def _iso_seconds(value: str | None) -> float | None:
+    m = _ISO_DURATION_RE.match((value or "").strip())
+    if not m or m.group(1) or m.group(2):                    # years/months: not a fixed length
+        return None
+    d, h, mi, sec = (float(g) if g else 0.0 for g in m.groups()[2:])
+    return d * 86400 + h * 3600 + mi * 60 + sec
+
+
+def _dash_expand(template: str, rep_id: str, bandwidth: int, number: int | None, time_: int | None) -> str:
+    def sub(m: re.Match[str]) -> str:
+        if m.group(0) == "$$":
+            return "$"
+        name, width = m.group(1), m.group(2)
+        value = {"RepresentationID": rep_id, "Bandwidth": bandwidth,
+                 "Number": number, "Time": time_}[name]
+        text = str(value)
+        return text.zfill(int(width)) if width and name != "RepresentationID" else text
+    return _DASH_TEMPLATE_RE.sub(sub, template)
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_children(el: ET.Element, name: str) -> list[ET.Element]:
+    return [c for c in el if _xml_local(c.tag) == name]
+
+
+def _xml_child(el: ET.Element, name: str) -> ET.Element | None:
+    kids = _xml_children(el, name)
+    return kids[0] if kids else None
+
+
+def _dash_base(base: str, *elements: ET.Element) -> str:
+    for el in elements:
+        bu = _xml_child(el, "BaseURL")
+        if bu is not None and (bu.text or "").strip():
+            base = urljoin(base, bu.text.strip())
+    return base
+
+
+def _dash_rep_segments(period: ET.Element, aset: ET.Element, rep: ET.Element, rep_base: str,
+                       duration_s: float | None) -> tuple[str | None, list[str]] | None:
+    """(init, media URLs) of one Representation; None = not plain enough."""
+    rep_id = rep.get("id", "")
+    bandwidth = int(rep.get("bandwidth", "0") or 0)
+
+    templates = [t for t in (_xml_child(period, "SegmentTemplate"),
+                             _xml_child(aset, "SegmentTemplate"),
+                             _xml_child(rep, "SegmentTemplate")) if t is not None]
+    if templates:
+        attrs: dict[str, str] = {}
+        timeline: ET.Element | None = None
+        for t in templates:                        # inner levels override outer ones
+            attrs.update(t.attrib)
+            found = _xml_child(t, "SegmentTimeline")
+            if found is not None:
+                timeline = found
+        media = attrs.get("media")
+        if not media:
+            return None
+        timescale = int(attrs.get("timescale", "1") or 1)
+        start_number = int(attrs.get("startNumber", "1") or 1)
+        entries: list[tuple[int, int]] = []       # (number, time)
+        if timeline is not None:
+            number, t_cursor = start_number, 0
+            for s_el in _xml_children(timeline, "S"):
+                if s_el.get("t") is not None:
+                    t_cursor = int(s_el.get("t"))
+                d = int(s_el.get("d"))
+                r = int(s_el.get("r", "0"))
+                if r < 0 or d <= 0 or len(entries) + r + 1 > MAX_SEGMENTS:
+                    return None                    # open-ended repeat: needs the period length
+                for _ in range(r + 1):
+                    entries.append((number, t_cursor))
+                    number += 1
+                    t_cursor += d
+        else:
+            seg_len = float(attrs.get("duration", "0") or 0)
+            if seg_len <= 0 or duration_s is None:
+                return None
+            count = -(-int(duration_s * timescale) // int(seg_len))   # ceil
+            if count <= 0 or count > MAX_SEGMENTS:
+                return None
+            entries = [(start_number + i, int(round(i * seg_len))) for i in range(count)]
+        init_t = attrs.get("initialization")
+        init = urljoin(rep_base, _dash_expand(init_t, rep_id, bandwidth, None, None)) if init_t else None
+        return init, [urljoin(rep_base, _dash_expand(media, rep_id, bandwidth, n, t)) for n, t in entries]
+
+    for holder in (rep, aset, period):
+        sl = _xml_child(holder, "SegmentList")
+        if sl is None:
+            continue
+        init_el = _xml_child(sl, "Initialization")
+        if init_el is not None and (init_el.get("range") or not init_el.get("sourceURL")):
+            return None
+        urls = []
+        for su in _xml_children(sl, "SegmentURL"):
+            if su.get("mediaRange") or not su.get("media"):
+                return None
+            urls.append(urljoin(rep_base, su.get("media")))
+        if not urls or len(urls) > MAX_SEGMENTS:
+            return None
+        return (urljoin(rep_base, init_el.get("sourceURL")) if init_el is not None else None), urls
+    return None                                    # SegmentBase / single file: nothing to parallelise
+
+
+def _plan_dash(text: str, base: str) -> StaticPlan | None:
+    try:
+        root = ET.fromstring(text.lstrip("\ufeff").strip())
+    except ET.ParseError:
+        return None
+    if _xml_local(root.tag) != "MPD" or root.get("type", "static") != "static":
+        return None
+    periods = _xml_children(root, "Period")
+    if len(periods) != 1:
+        return None                                # new init segments mid-stream: ffmpeg's job
+    period = periods[0]
+    duration_s = _iso_seconds(period.get("duration")) or _iso_seconds(root.get("mediaPresentationDuration"))
+    mpd_base = _dash_base(base, root)
+    period_base = _dash_base(mpd_base, period)
+
+    best_video: tuple[int, ET.Element, ET.Element] | None = None
+    audio_pick: list[tuple[ET.Element, ET.Element]] = []
+    for aset in _xml_children(period, "AdaptationSet"):
+        reps = _xml_children(aset, "Representation")
+        if not reps:
+            continue
+        mime = aset.get("mimeType") or reps[0].get("mimeType") or ""
+        ctype = aset.get("contentType") or mime.split("/")[0]
+        bw = lambda r: int(r.get("bandwidth", "0") or 0)
+        top = max(reps, key=bw)
+        if ctype == "video":
+            if best_video is None or bw(top) > best_video[0]:
+                best_video = (bw(top), aset, top)
+        elif ctype == "audio":
+            audio_pick.append((aset, top))
+
+    tracks: list[TrackPlan] = []
+    picks: list[tuple[str, ET.Element, ET.Element]] = []
+    if best_video is not None:
+        picks.append(("video", best_video[1], best_video[2]))
+    picks += [("audio", a, r) for a, r in audio_pick]
+    for kind, aset, rep in picks:
+        segs = _dash_rep_segments(period, aset, rep, _dash_base(period_base, aset, rep), duration_s)
+        if segs is None:
+            return None
+        init, urls = segs
+        mime = rep.get("mimeType") or aset.get("mimeType") or ""
+        tracks.append(TrackPlan(kind, "mpegts" if "mp2t" in mime else "mp4", init, urls,
+                                aset.get("lang") or kind))
+    return StaticPlan("dash", tracks) if tracks else None
+
+
+# -- planning entry point ---------------------------------------------------------
+
+async def _vet_plan_hosts(plan: StaticPlan, manifest_url: str) -> str | None:
+    """The proxy itself now requests every segment URL the manifest names, so
+    apply the same SSRF policy ffmpeg's targets get: the manifest's own origin
+    (the backend / the redirect target that was already vetted) is fine, any
+    other origin must pass _validate_url."""
+    seen = {_origin(manifest_url)}
+    for track in plan.tracks:
+        for url in track.urls():
+            o = _origin(url)
+            if o in seen:
+                continue
+            if o[0] not in ("http", "https"):
+                return f"segment scheme {o[0]!r} not allowed"
+            ok, reason = await _validate_url(url)
+            if not ok:
+                return reason
+            seen.add(o)
+    return None
+
+
+async def _plan_static(session: aiohttp.ClientSession, res: Resolved) -> StaticPlan | None:
+    """The fast-path plan for a resolved manifest, or None = let ffmpeg fetch."""
+    if PARALLEL_SEGMENTS <= 0 or FFMPEG_EXTRA_IN or res.text is None:
+        return None            # FFMPEG_EXTRA_IN (e.g. -headers) can't be replayed on our own requests
+    try:
+        if res.kind == "hls":
+            plan = await _plan_hls(session, res.text, res.base_url)
+        elif res.kind == "dash":
+            plan = _plan_dash(res.text, res.base_url)
+        else:
+            return None
+        if plan is None:
+            logger.info("manifest is not a plain static one; ffmpeg fetches the segments")
+            return None
+        reason = await _vet_plan_hosts(plan, res.base_url)
+        if reason:
+            logger.warning(f"static fast path off ({reason}); ffmpeg fetches the segments")
+            return None
+        return plan
+    except Exception as e:                         # a planner bug must never break playback
+        logger.warning(f"static manifest planning failed ({e!r}); ffmpeg fetches the segments")
+        return None
+
+
+# -- fetching + feeding -----------------------------------------------------------
+
+class SegmentError(Exception):
+    pass
+
+
+_RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+async def _fetch_segment(session: aiohttp.ClientSession, url: str) -> bytes:
+    delay = 0.5
+    last = "no attempt"
+    headers = {"User-Agent": USER_AGENT} if USER_AGENT else None
+    for attempt in range(SEGMENT_RETRIES + 1):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)) as r:
+                if r.status == 200:
+                    buf = bytearray()
+                    async for chunk in r.content.iter_chunked(256 * 1024):
+                        buf += chunk
+                        if len(buf) > SEGMENT_MAX_BYTES:
+                            raise SegmentError(f"segment larger than {SEGMENT_MAX_BYTES} bytes")
+                    return bytes(buf)
+                last = f"HTTP {r.status}"
+                if r.status not in _RETRY_STATUS:
+                    break
+        except SegmentError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last = type(e).__name__
+        if attempt < SEGMENT_RETRIES:
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise SegmentError(f"{last} for {loggable_url(url)}")
+
+
+async def _open_write_pipe(wfd: int) -> asyncio.StreamWriter:
+    """Async writer (with drain() backpressure) for the parent's end of a pipe."""
+    loop = asyncio.get_running_loop()
+    protocol = asyncio.streams.FlowControlMixin(loop=loop)
+    transport, _ = await loop.connect_write_pipe(lambda: protocol, os.fdopen(wfd, "wb", buffering=0))
+    return asyncio.StreamWriter(transport, protocol, None, loop)
+
+
+async def _feed_track(session: aiohttp.ClientSession, track: TrackPlan,
+                      writer: asyncio.StreamWriter, info: StreamInfo) -> None:
+    """Download track.urls() with up to PARALLEL_SEGMENTS requests in flight
+    and write the bodies into the pipe strictly in order."""
+    urls = iter(track.urls())
+    pending: deque[asyncio.Task] = deque()
+
+    def top_up() -> None:
+        while len(pending) < PARALLEL_SEGMENTS:
+            url = next(urls, None)
+            if url is None:
+                return
+            pending.append(asyncio.create_task(_fetch_segment(session, url)))
+
+    try:
+        top_up()
+        while pending:
+            data = await pending.popleft()
+            top_up()                       # refill BEFORE the (maybe slow) write: the window stays full
+            writer.write(data)
+            await writer.drain()           # blocks while ffmpeg / the client are slower
+    except (BrokenPipeError, ConnectionResetError):
+        pass                               # ffmpeg is gone; the handler sees that on its own
+    except asyncio.CancelledError:
+        raise
+    except SegmentError as e:
+        logger.error(f"on-demand {info.stream_id}: {track.label}: {e}")
+        info.fail_feed(str(e))
+    except Exception as e:
+        logger.error(f"on-demand {info.stream_id}: {track.label} feeder crashed: {e!r}")
+        info.fail_feed(repr(e))
+    finally:
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await t
+        with contextlib.suppress(Exception):
+            writer.close()                 # EOF for ffmpeg: this track is complete (or abandoned)
 
 
 # ===== HTTP handlers =====
@@ -1810,11 +2402,15 @@ async def _serve_live(request: web.Request, mgr: StreamManager, key: str, name: 
 
 
 async def _serve_ondemand(request: web.Request, mgr: StreamManager, key: str, name: str,
-                          resolve, start: float | None) -> web.StreamResponse:
+                          resolve, start: float | None, *, allow_fast: bool = True) -> web.StreamResponse:
     """VOD / recording / catchup playback: one ffmpeg per request, wired
     straight to the client. No fan-out buffer and therefore no live-edge
     skipping: when the client is slower than ffmpeg the socket write blocks,
-    stdout fills up and ffmpeg waits. Nothing is ever dropped."""
+    stdout fills up and ffmpeg waits. Nothing is ever dropped.
+
+    A static manifest is downloaded by this proxy with several segments in
+    flight (see "Static manifests"); if that cannot produce a first byte, the
+    request is retried once with ffmpeg doing the fetching, as before."""
     if not mgr.acquire_ondemand():
         return _json_error(
             503, f"too many on-demand streams (max {MAX_ONDEMAND})",
@@ -1827,27 +2423,57 @@ async def _serve_ondemand(request: web.Request, mgr: StreamManager, key: str, na
         except BackendError as e:
             return _backend_error_response(e)
 
-        info = await mgr.start_ondemand(key, name, res.source, res.map_args, res.kind, start)
+        plan = None
+        # -ss on a pipe can only discard data; a start offset keeps ffmpeg's own input seek.
+        if allow_fast and start is None:
+            plan = await _plan_static(request.app["client_session"], res)
+
+        first = b""
+        for attempt in ([plan] if plan is not None else []) + [None]:
+            fast = attempt is not None
+            if fast:
+                info = await mgr.start_ondemand_fast(key, name, attempt, request.app["client_session"])
+            else:
+                info = await mgr.start_ondemand(key, name, res.source, res.map_args, res.kind, start)
+            if info is None:
+                if fast:
+                    continue
+                return _json_error(502, "failed to start ffmpeg", hint="is ffmpeg installed and on PATH?")
+
+            # First byte BEFORE headers, so failures are real HTTP errors.
+            try:
+                first = await asyncio.wait_for(
+                    info.process.stdout.read(STREAM_READ_SIZE), timeout=STARTUP_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                if fast:
+                    logger.warning(f"on-demand {info.stream_id}: no data from the parallel fetch within "
+                                   f"{STARTUP_TIMEOUT}s; retrying with ffmpeg fetching")
+                    await mgr.finish_ondemand(info)
+                    info = None
+                    continue
+                return _json_error(
+                    504, f"source produced no data within {STARTUP_TIMEOUT}s",
+                    hint=_hint_from_stderr(info.stderr_tail),
+                    details=list(info.stderr_tail)[-10:] or None,
+                )
+            if not first:
+                await _await_stderr(info)
+                if fast:
+                    logger.warning(
+                        f"on-demand {info.stream_id}: parallel fetch failed before the first byte "
+                        f"({info.feed_error or 'ffmpeg exited'}); retrying with ffmpeg fetching")
+                    await mgr.finish_ondemand(info)
+                    info = None
+                    continue
+                return _startup_failure(info)
+            break
         if info is None:
             return _json_error(502, "failed to start ffmpeg", hint="is ffmpeg installed and on PATH?")
 
-        # First byte BEFORE headers, so failures are real HTTP errors.
-        try:
-            first = await asyncio.wait_for(
-                info.process.stdout.read(STREAM_READ_SIZE), timeout=STARTUP_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            return _json_error(
-                504, f"source produced no data within {STARTUP_TIMEOUT}s",
-                hint=_hint_from_stderr(info.stderr_tail),
-                details=list(info.stderr_tail)[-10:] or None,
-            )
-        if not first:
-            await _await_stderr(info)
-            return _startup_failure(info)
-
         response = web.StreamResponse(headers=_stream_headers("ondemand", res.kind))
         response.headers["X-TS-Shared"] = "0"
+        response.headers["X-TS-Fetch"] = info.fetch_mode
         await response.prepare(request)
 
         carry = bytearray()
@@ -1875,6 +2501,14 @@ async def _serve_ondemand(request: web.Request, mgr: StreamManager, key: str, na
                     break
                 if not chunk:
                     break
+            if info.feed_error:
+                # A segment could not be fetched mid-download. A clean end of
+                # the chunked body would make the file look complete; hang up
+                # so the client sees an incomplete download instead.
+                logger.error(f"on-demand {info.stream_id}: aborting the response ({info.feed_error})")
+                if request.transport is not None:
+                    request.transport.abort()
+                return response
             if carry:
                 await response.write(bytes(carry))
             await response.write_eof()
@@ -1886,9 +2520,15 @@ async def _serve_ondemand(request: web.Request, mgr: StreamManager, key: str, na
             logger.warning(f"on-demand {info.stream_id} write failed: {e}")
         return response
     finally:
-        if info is not None:
-            await mgr.finish_ondemand(info)
-        mgr.release_ondemand()
+        # Hanging up on the client (transport.abort(), or the client leaving)
+        # makes aiohttp cancel this handler; the cancellation is then delivered
+        # at the first await below. Shield the cleanup and release the slot
+        # whatever happens, or each such request would leak an on-demand slot.
+        try:
+            if info is not None:
+                await asyncio.shield(mgr.finish_ondemand(info))
+        finally:
+            mgr.release_ondemand()
 
 
 async def ts_handler(request: web.Request) -> web.StreamResponse:
@@ -1930,7 +2570,8 @@ async def ts_handler(request: web.Request) -> web.StreamResponse:
 
     logger.info(f"{request.remote} -> {kind}/{provider}/{content_id} ({mode})")
     if ondemand:
-        return await _serve_ondemand(request, mgr, backend_url, name, resolve, start)
+        return await _serve_ondemand(request, mgr, backend_url, name, resolve, start,
+                                     allow_fast=request.query.get("fast") != "0")
     return await _serve_live(request, mgr, backend_url, name, resolve=resolve)
 
 
